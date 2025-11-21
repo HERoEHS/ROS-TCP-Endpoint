@@ -340,3 +340,23 @@ class SysCommands:
         except (IndexError, KeyError, AttributeError, ImportError) as e:
             self.tcp_server.logerr("Failed to resolve message name: {}".format(e))
             return None
+
+    def remove_subscriber(self, topic):
+        if topic == "":
+            self.tcp_server.send_unity_error(
+                "Can't unsubscribe to a blank topic name! SysCommand.remove_subscriber({}, {})".format(
+                    topic
+                )
+            )
+            return
+
+        node = self.tcp_server.subscribers_table.get(topic)
+        if node is not None:
+            self.tcp_server.unregister_node(node)
+            self.tcp_server.loginfo("UnregisterSubscriber({}) OK".format(topic))
+        else:
+            self.tcp_server.send_unity_error(
+                "Can't unsubscribe node if not previously subscribed! SysCommand.remove_subscriber({})".format(
+                    topic
+                )
+            )
