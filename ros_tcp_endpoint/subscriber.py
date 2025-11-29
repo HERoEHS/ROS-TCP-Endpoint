@@ -42,6 +42,7 @@ class RosSubscriber(RosReceiver):
         self.msg = message_class
         self.tcp_server = tcp_server
         self.queue_size = queue_size
+        self._is_unregistered = False
 
         qos_profile = QoSProfile(depth=queue_size,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -64,6 +65,9 @@ class RosSubscriber(RosReceiver):
             self.msg: The deserialize message
 
         """
+        if self._is_unregistered:
+            return self.msg
+
         self.tcp_server.send_unity_message(self.topic, data)
         return self.msg
 
