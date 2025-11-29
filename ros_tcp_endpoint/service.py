@@ -15,6 +15,7 @@
 import rclpy
 import re
 import time
+import uuid
 
 from rclpy.serialization import deserialize_message
 
@@ -33,7 +34,8 @@ class RosService(RosSender):
             service_class:  The service class in catkin workspace
         """
         strippedService = re.sub("[^A-Za-z0-9_]+", "", service)
-        node_name = f"{strippedService}_RosService"
+        unique_suffix = uuid.uuid4().hex[:8]
+        node_name = f"{strippedService}_RosService_{unique_suffix}"
         RosSender.__init__(self, node_name)
 
         self.service_topic = service

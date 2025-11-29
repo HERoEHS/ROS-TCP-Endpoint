@@ -27,19 +27,19 @@
 - [ ] [Agent] 필요 시 `publishers_table`, `subscribers_table` 등에 threading.Lock 적용
 - [x] [Agent] `pending_srv_id` 멀티 클라이언트 race condition 해결 (클라이언트별 분리)
 
-#### 멀티 클라이언트 지원
-- [ ] 현재 단일 클라이언트 제한 구조 분석 (`self.queue` 단일 참조)
-- [ ] [Agent] 클라이언트별 큐 관리 구조로 변경 (`self.queues` 딕셔너리/리스트)
-- [ ] [Agent] 클라이언트 연결/해제 시 큐 등록/제거 로직 추가
+#### 멀티 클라이언트 지원 ✅
+- [x] 현재 단일 클라이언트 제한 구조 분석 (`self.queue` 단일 참조)
+- [x] [Agent] 클라이언트별 큐 관리 구조로 변경 (`self.queues` 딕셔너리)
+- [x] [Agent] 클라이언트 연결/해제 시 큐 등록/제거 로직 추가
 - [ ] 다수 클라이언트 동시 연결 테스트
 
-#### 메모리 최적화 (고주파 토픽) - Latest-Only + 설정 파일 방식
-- [ ] [Agent] `config/topic_policy.yaml` 설정 파일 구조 생성
-- [ ] [Agent] `tcp_sender.py`에 설정 파일 로드 기능 추가
-- [ ] [Agent] 토픽별 정책 분기 구현 (`latest_only` vs `queue`)
-- [ ] [Agent] 선택적 스로틀링 (`max_frequency`) 구현
-- [ ] [Agent] launch 파라미터로 설정 파일 경로 지정 기능
-- [ ] 설정 파일 예시 작성 및 문서화
+#### 메모리 최적화 (고주파 토픽) - Latest-Only + 설정 파일 방식 ✅
+- [x] [Agent] `config/topic_policy.yaml` 설정 파일 구조 생성
+- [x] [Agent] `tcp_sender.py`에 설정 파일 로드 기능 추가
+- [x] [Agent] 토픽별 정책 분기 구현 (`latest_only` vs `queue`)
+- [x] [Agent] 선택적 스로틀링 (`max_frequency`) 구현
+- [x] [Agent] launch 파라미터로 설정 파일 경로 지정 기능
+- [x] 설정 파일 예시 작성 및 문서화
 
 #### 안정성 개선 (Medium) ✅
 - [x] [Agent] `thread_pauser.py` 서비스 타임아웃 추가 (영구 블록 방지)
@@ -48,10 +48,10 @@
 - [x] [Agent] `server.py` socket.bind() 예외 처리 추가 (포트 충돌)
 - [x] [Agent] `client.py` 메시지 크기 제한 추가 (메모리 공격 방지)
 
-#### 개선 권장 (Low)
+#### 개선 권장 (Low) ✅
 - [x] [Agent] TCP 소켓 최적화 (`TCP_NODELAY`, `SO_KEEPALIVE`)
-- [ ] [Agent] Graceful shutdown 구현 (연결 정리, 소켓 close)
-- [ ] [Agent] 노드 이름 충돌 방지 (유니크 suffix 추가)
+- [x] [Agent] Graceful shutdown 구현 (연결 정리, 소켓 close)
+- [x] [Agent] 노드 이름 충돌 방지 (유니크 suffix 추가)
 - [x] [Agent] `subscriber.py:56` 의미 없는 코드 제거
 
 #### 테스트 및 검증

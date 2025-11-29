@@ -17,6 +17,7 @@ import socket
 import time
 import threading
 import json
+import os
 
 from rclpy.node import Node
 from rclpy.serialization import deserialize_message
@@ -33,65 +34,132 @@ except:
     from Queue import Queue
     from Queue import Empty
 
+# YAML 로드 (선택적)
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
+
 
 class UnityTcpSender:
     """
     Sends messages to Unity.
     """
 
-    def __init__(self, tcp_server):
+    def __init__(self, tcp_server, config_path=None):
         # super().__init__(f'UnityTcpSender')
 
         self.sender_id = 1
         self.time_between_halt_checks = 5
         self.tcp_server = tcp_server
 
-        # Each sender thread has its own queue: this is always the queue for the currently active thread.
-        self.queue = None
-        self.queue_lock = threading.Lock()
+        # 멀티 클라이언트 지원: 클라이언트별 큐 관리
+        self.queues = {}  # {client_id: Queue}
+        self.queues_lock = threading.Lock()
 
         # variables needed for matching up unity service requests with responses
         self.next_srv_id = 1001
         self.srv_lock = threading.Lock()
         self.services_waiting = {}
 
+        # 메모리 최적화: 토픽별 정책
+        self.topic_policies = {}
+        self.default_policy = {'policy': 'queue', 'max_queue_size': 100}
+        self.latest_messages = {}  # {topic: serialized_message} for latest_only
+        self.latest_lock = threading.Lock()
+        self.last_send_time = {}  # {topic: timestamp} for throttling
+
+        # 설정 파일 로드
+        if config_path:
+            self._load_config(config_path)
+        else:
+            # 기본 설정 파일 경로
+            default_config = os.path.join(
+                os.path.dirname(__file__), 'config', 'topic_policy.yaml'
+            )
+            if os.path.exists(default_config):
+                self._load_config(default_config)
+
+    def _load_config(self, path):
+        """YAML 설정 파일 로드"""
+        if not YAML_AVAILABLE:
+            self.tcp_server.logwarn("PyYAML not installed, using default topic policies")
+            return
+
+        try:
+            with open(path, 'r') as f:
+                config = yaml.safe_load(f)
+            self.topic_policies = config.get('topic_policies', {}) or {}
+            self.default_policy = config.get('default_policy', self.default_policy)
+            self.tcp_server.loginfo(f"Loaded topic policy config from {path}")
+        except Exception as e:
+            self.tcp_server.logwarn(f"Failed to load config {path}: {e}")
+
+    def _get_policy(self, topic):
+        """토픽별 정책 반환"""
+        return self.topic_policies.get(topic, self.default_policy)
+
+    def _broadcast_to_all_clients(self, data):
+        """모든 연결된 클라이언트에게 메시지 전송"""
+        with self.queues_lock:
+            for queue in self.queues.values():
+                queue.put(data)
+
     def send_unity_info(self, text):
-        if self.queue is not None:
-            command = SysCommand_Log()
-            command.text = text
-            serialized_bytes = ClientThread.serialize_command("__log", command)
-            self.queue.put(serialized_bytes)
+        command = SysCommand_Log()
+        command.text = text
+        serialized_bytes = ClientThread.serialize_command("__log", command)
+        self._broadcast_to_all_clients(serialized_bytes)
 
     def send_unity_warning(self, text):
-        if self.queue is not None:
-            command = SysCommand_Log()
-            command.text = text
-            serialized_bytes = ClientThread.serialize_command("__warn", command)
-            self.queue.put(serialized_bytes)
+        command = SysCommand_Log()
+        command.text = text
+        serialized_bytes = ClientThread.serialize_command("__warn", command)
+        self._broadcast_to_all_clients(serialized_bytes)
 
     def send_unity_error(self, text):
-        if self.queue is not None:
-            command = SysCommand_Log()
-            command.text = text
-            serialized_bytes = ClientThread.serialize_command("__error", command)
-            self.queue.put(serialized_bytes)
+        command = SysCommand_Log()
+        command.text = text
+        serialized_bytes = ClientThread.serialize_command("__error", command)
+        self._broadcast_to_all_clients(serialized_bytes)
 
     def send_ros_service_response(self, srv_id, destination, response):
-        if self.queue is not None:
-            command = SysCommand_Service()
-            command.srv_id = srv_id
-            serialized_header = ClientThread.serialize_command("__response", command)
-            serialized_message = ClientThread.serialize_message(destination, response)
-            self.queue.put(b"".join([serialized_header, serialized_message]))
+        command = SysCommand_Service()
+        command.srv_id = srv_id
+        serialized_header = ClientThread.serialize_command("__response", command)
+        serialized_message = ClientThread.serialize_message(destination, response)
+        self._broadcast_to_all_clients(b"".join([serialized_header, serialized_message]))
 
     def send_unity_message(self, topic, message):
-        if self.queue is not None:
-            serialized_message = ClientThread.serialize_message(topic, message)
-            self.queue.put(serialized_message)
+        """토픽 정책에 따라 메시지 전송"""
+        policy = self._get_policy(topic)
+        is_latest_only = policy.get('policy') == 'latest_only'
+
+        serialized_message = ClientThread.serialize_message(topic, message)
+
+        if is_latest_only:
+            # latest_only: 항상 최신 값 저장 (스로틀링과 무관)
+            with self.latest_lock:
+                self.latest_messages[topic] = serialized_message
+        else:
+            # 큐 방식: 스로틀링 체크 후 브로드캐스트
+            max_freq = policy.get('max_frequency', 0)
+            if max_freq > 0:
+                now = time.time()
+                min_interval = 1.0 / max_freq
+                last_time = self.last_send_time.get(topic, 0)
+                if now - last_time < min_interval:
+                    return  # 스킵
+                self.last_send_time[topic] = now
+
+            self._broadcast_to_all_clients(serialized_message)
 
     def send_unity_service_request(self, topic, service_class, request):
-        if self.queue is None:
-            return None
+        # 연결된 클라이언트가 없으면 실패
+        with self.queues_lock:
+            if not self.queues:
+                return None
 
         thread_pauser = ThreadPauser()
         with self.srv_lock:
@@ -103,7 +171,7 @@ class UnityTcpSender:
         command.srv_id = srv_id
         serialized_header = ClientThread.serialize_command("__request", command)
         serialized_message = ClientThread.serialize_message(topic, request)
-        self.queue.put(b"".join([serialized_header, serialized_message]))
+        self._broadcast_to_all_clients(b"".join([serialized_header, serialized_message]))
 
         # rospy starts a new thread for each service request,
         # so it won't break anything if we sleep now while waiting for the response
@@ -141,27 +209,26 @@ class UnityTcpSender:
             return None
 
     def send_topic_list(self):
-        if self.queue is not None:
-            topic_list = SysCommand_TopicsResponse()
-            topics_and_types = self.tcp_server.get_topic_names_and_types()
-            topic_list.topics = [item[0] for item in topics_and_types]
-            for i in topics_and_types:
-                node = self.get_registered_topic(i[0])
-                if len(i[1]) > 1:
-                    if node is not None:
-                        self.tcp_server.get_logger().warning(
-                            "Only one message type per topic is supported, but found multiple types for topic {}; maintaining {} as the subscribed type.".format(
-                                i[0], self.parse_message_name(node.msg)
-                            )
+        topic_list = SysCommand_TopicsResponse()
+        topics_and_types = self.tcp_server.get_topic_names_and_types()
+        topic_list.topics = [item[0] for item in topics_and_types]
+        for i in topics_and_types:
+            node = self.get_registered_topic(i[0])
+            if len(i[1]) > 1:
+                if node is not None:
+                    self.tcp_server.get_logger().warning(
+                        "Only one message type per topic is supported, but found multiple types for topic {}; maintaining {} as the subscribed type.".format(
+                            i[0], self.parse_message_name(node.msg)
                         )
-                topic_list.types = [
-                    item[1][0].replace("/msg/", "/")
-                    if (len(item[1]) <= 1)
-                    else self.parse_message_name(node.msg)
-                    for item in topics_and_types
-                ]
-            serialized_bytes = ClientThread.serialize_command("__topic_list", topic_list)
-            self.queue.put(serialized_bytes)
+                    )
+            topic_list.types = [
+                item[1][0].replace("/msg/", "/")
+                if (len(item[1]) <= 1)
+                else self.parse_message_name(node.msg)
+                for item in topics_and_types
+            ]
+        serialized_bytes = ClientThread.serialize_command("__topic_list", topic_list)
+        self._broadcast_to_all_clients(serialized_bytes)
 
     def start_sender(self, conn, halt_event):
         sender_thread = threading.Thread(
@@ -174,27 +241,60 @@ class UnityTcpSender:
         sender_thread.start()
 
     def sender_loop(self, conn, tid, halt_event):
-        s = None
         local_queue = Queue()
+        # 이 클라이언트가 마지막으로 보낸 latest_only 메시지 추적
+        last_sent = {}  # {topic: serialized_message}
 
         # send a handshake message to confirm the connection and version number
         handshake_metadata = SysCommand_Handshake_Metadata()
         handshake = SysCommand_Handshake(handshake_metadata)
         local_queue.put(ClientThread.serialize_command("__handshake", handshake))
 
-        with self.queue_lock:
-            self.queue = local_queue
+        # 클라이언트 큐 등록
+        with self.queues_lock:
+            self.queues[tid] = local_queue
+
+        self.tcp_server.loginfo(f"Client {tid} registered (total: {len(self.queues)} clients)")
+
+        # 클라이언트별 토픽 전송 시간 추적 (스로틀링용)
+        last_sent_time = {}  # {topic: timestamp}
 
         try:
             while not halt_event.is_set():
-                try:
-                    item = local_queue.get(timeout=self.time_between_halt_checks)
-                except Empty:
-                    # I'd like to just wait on the queue, but we also need to check occasionally for the connection being closed
-                    # (otherwise the thread never terminates.)
-                    continue
+                now = time.time()
 
-                # print("Sender {} sending an item".format(tid))
+                # 1. latest_only 토픽들의 최신 메시지 전송
+                with self.latest_lock:
+                    latest_copy = dict(self.latest_messages)
+
+                for topic, msg in latest_copy.items():
+                    # 이전에 보낸 메시지와 다를 때만 전송
+                    if last_sent.get(topic) is not msg:
+                        # 스로틀링 체크
+                        policy = self._get_policy(topic)
+                        max_freq = policy.get('max_frequency', 0)
+                        if max_freq > 0:
+                            min_interval = 1.0 / max_freq
+                            if now - last_sent_time.get(topic, 0) < min_interval:
+                                continue  # 이 토픽은 스킵
+
+                        try:
+                            conn.sendall(msg)
+                            last_sent[topic] = msg
+                            last_sent_time[topic] = now
+                        except Exception as e:
+                            self.tcp_server.logerr(f"Exception sending latest message: {e}")
+                            halt_event.set()
+                            break
+
+                if halt_event.is_set():
+                    break
+
+                # 2. 큐에서 메시지 가져오기 (짧은 타임아웃)
+                try:
+                    item = local_queue.get(timeout=0.01)  # 10ms 타임아웃 (더 빠른 반응)
+                except Empty:
+                    continue
 
                 try:
                     conn.sendall(item)
@@ -203,9 +303,11 @@ class UnityTcpSender:
                     break
         finally:
             halt_event.set()
-            with self.queue_lock:
-                if self.queue is local_queue:
-                    self.queue = None
+            # 클라이언트 큐 해제
+            with self.queues_lock:
+                if tid in self.queues:
+                    del self.queues[tid]
+            self.tcp_server.loginfo(f"Client {tid} unregistered (total: {len(self.queues)} clients)")
 
     def parse_message_name(self, name):
         try:

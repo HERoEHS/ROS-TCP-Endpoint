@@ -14,6 +14,7 @@
 
 import rclpy
 import re
+import uuid
 
 from rclpy.serialization import deserialize_message
 
@@ -35,7 +36,8 @@ class RosPublisher(RosSender):
             queue_size:    Max number of entries to maintain in an outgoing queue
         """
         strippedTopic = re.sub("[^A-Za-z0-9_]+", "", topic)
-        node_name = f"{strippedTopic}_RosPublisher"
+        unique_suffix = uuid.uuid4().hex[:8]
+        node_name = f"{strippedTopic}_RosPublisher_{unique_suffix}"
         RosSender.__init__(self, node_name)
         self.msg = message_class()
         self.pub = self.create_publisher(message_class, topic, queue_size)
