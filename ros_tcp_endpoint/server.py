@@ -167,10 +167,41 @@ class TcpServer(Node):
         executor.spin()
 
     def unregister_node(self, old_node):
-        if old_node is not None:
-            old_node.unregister()
-            if self.executor is not None:
+        """
+        Safely unregister a node from the executor.
+        Handles race condition where executor might still be processing callbacks.
+        """
+        if old_node is None:
+            return
+
+        import time
+
+        # 1. 먼저 executor에서 제거 (spin이 더 이상 이 노드를 처리하지 않도록)
+        if self.executor is not None:
+            try:
                 self.executor.remove_node(old_node)
+            except ValueError:
+                # 이미 제거된 경우
+                pass
+            except Exception as e:
+                self.logerr(f"Error removing node from executor: {e}")
+
+        # 2. 진행 중인 콜백이 완료되도록 약간의 지연
+        time.sleep(0.05)
+
+        # 3. subscription 정리 (unregister 호출)
+        try:
+            old_node.unregister()
+        except Exception as e:
+            self.logerr(f"Error unregistering node: {e}")
+
+        # 4. 추가 지연 후 노드 파괴
+        time.sleep(0.05)
+
+        try:
+            old_node.destroy_node()
+        except Exception as e:
+            self.logerr(f"Error destroying node: {e}")
 
     def destroy_nodes(self):
         """
@@ -344,7 +375,7 @@ class SysCommands:
     def remove_subscriber(self, topic):
         if topic == "":
             self.tcp_server.send_unity_error(
-                "Can't unsubscribe to a blank topic name! SysCommand.remove_subscriber({}, {})".format(
+                "Can't unsubscribe to a blank topic name! SysCommand.remove_subscriber({})".format(
                     topic
                 )
             )
@@ -352,11 +383,15 @@ class SysCommands:
 
         node = self.tcp_server.subscribers_table.get(topic)
         if node is not None:
+            # 먼저 테이블에서 제거
+            del self.tcp_server.subscribers_table[topic]
+
+            # 그 다음 노드 정리
             self.tcp_server.unregister_node(node)
             self.tcp_server.loginfo("UnregisterSubscriber({}) OK".format(topic))
         else:
-            self.tcp_server.send_unity_error(
-                "Can't unsubscribe node if not previously subscribed! SysCommand.remove_subscriber({})".format(
+            self.tcp_server.logwarn(
+                "Topic '{}' was not subscribed, ignoring remove_subscriber request.".format(
                     topic
                 )
             )

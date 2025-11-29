@@ -69,9 +69,15 @@ class RosSubscriber(RosReceiver):
 
     def unregister(self):
         """
-
-        Returns:
-
+        Safely unregister the subscriber.
+        destroy_node()는 server.py의 unregister_node()에서 별도로 호출됨.
         """
-        self.destroy_subscription(self.subscription)
-        self.destroy_node()
+        self._is_unregistered = True
+
+        try:
+            if self.subscription is not None:
+                self.destroy_subscription(self.subscription)
+                self.subscription = None
+        except Exception as e:
+            if self.tcp_server:
+                self.tcp_server.logerr(f"Error destroying subscription for {self.topic}: {e}")
