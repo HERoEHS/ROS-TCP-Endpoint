@@ -58,8 +58,9 @@ class UnityService(RosReceiver):
 
     def unregister(self):
         """
-
-        Returns:
-
+        Clean up the service before destroying the node.
         """
+        if self.service is not None:
+            self.destroy_service(self.service)
+            self.service = None
         self.destroy_node()

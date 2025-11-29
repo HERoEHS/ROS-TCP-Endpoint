@@ -14,6 +14,7 @@
 
 import rclpy
 import re
+import time
 
 from rclpy.serialization import deserialize_message
 
@@ -60,17 +61,30 @@ class RosService(RosSender):
             )
             return None
 
-        self.future = self.cli.call_async(message)
+        future = self.cli.call_async(message)
+
+        # spin_until_future_complete 대신 타임아웃과 함께 대기
+        timeout_sec = 30.0
+        start_time = self.get_clock().now()
 
         while rclpy.ok():
-            if self.future.done():
+            if future.done():
                 try:
-                    response = self.future.result()
-                    return response
+                    return future.result()
                 except Exception as e:
-                    self.get_logger().info(f"Service call failed {e}")
+                    self.get_logger().error(f"Service call failed: {e}")
+                    return None
 
-                break
+            # 타임아웃 체크
+            elapsed = (self.get_clock().now() - start_time).nanoseconds / 1e9
+            if elapsed > timeout_sec:
+                self.get_logger().error(
+                    f"Service call to {self.service_topic} timed out after {timeout_sec}s"
+                )
+                return None
+
+            # CPU 사용량 감소를 위한 짧은 sleep
+            time.sleep(0.01)
 
         return None
 

@@ -107,7 +107,15 @@ class UnityTcpSender:
 
         # rospy starts a new thread for each service request,
         # so it won't break anything if we sleep now while waiting for the response
-        thread_pauser.sleep_until_resumed()
+        resumed = thread_pauser.sleep_until_resumed(timeout=30.0)
+
+        if not resumed or thread_pauser.result is None:
+            # 타임아웃 또는 결과 없음 - 대기 목록에서 제거
+            with self.srv_lock:
+                if srv_id in self.services_waiting:
+                    del self.services_waiting[srv_id]
+            self.tcp_server.logerr(f"Unity service request to '{topic}' timed out")
+            return None
 
         response = deserialize_message(thread_pauser.result, service_class.Response())
         return response
@@ -213,18 +221,18 @@ class UnityTcpSender:
 
 class SysCommand_Log:
     def __init__(self):
-        text = ""
+        self.text = ""
 
 
 class SysCommand_Service:
     def __init__(self):
-        srv_id = 0
+        self.srv_id = 0
 
 
 class SysCommand_TopicsResponse:
     def __init__(self):
-        topics = []
-        types = []
+        self.topics = []
+        self.types = []
 
 
 class SysCommand_Handshake:

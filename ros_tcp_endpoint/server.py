@@ -75,6 +75,7 @@ class TcpServer(Node):
         self.syscommands = SysCommands(self)
         self.pending_srv_id = None
         self.pending_srv_is_request = False
+        self.executor = None
 
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
@@ -94,13 +95,22 @@ class TcpServer(Node):
         self.loginfo("Starting server on {}:{}".format(self.tcp_ip, self.tcp_port))
         tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        tcp_server.bind((self.tcp_ip, self.tcp_port))
+
+        try:
+            tcp_server.bind((self.tcp_ip, self.tcp_port))
+        except OSError as e:
+            self.logerr("Failed to bind to {}:{} - {}".format(self.tcp_ip, self.tcp_port, e))
+            self.logerr("Port may already be in use. Please check and try again.")
+            return
 
         while True:
             tcp_server.listen(self.connections)
 
             try:
                 (conn, (ip, port)) = tcp_server.accept()
+                # 소켓 최적화: 지연 최소화 및 연결 감지
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 ClientThread(conn, self, ip, port).start()
             except socket.timeout as err:
                 self.logerr("ros_tcp_endpoint.TcpServer: socket timeout")
@@ -117,14 +127,22 @@ class TcpServer(Node):
     def send_unity_service_response(self, srv_id, data):
         self.unity_tcp_sender.send_unity_service_response(srv_id, data)
 
-    def handle_syscommand(self, topic, data):
-        function = getattr(self.syscommands, topic[2:])
+    def handle_syscommand(self, topic, data, client=None):
+        function = getattr(self.syscommands, topic[2:], None)
         if function is None:
             self.send_unity_error("Don't understand SysCommand.'{}'".format(topic))
-        else:
+            return
+
+        try:
             message_json = data.decode("utf-8")[:-1]
             params = json.loads(message_json)
+            # 서비스 요청/응답 명령은 클라이언트 참조 필요
+            self.syscommands.current_client = client
             function(**params)
+            self.syscommands.current_client = None
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            self.send_unity_error("Invalid syscommand data for '{}': {}".format(topic, e))
+            self.logerr("Failed to parse syscommand '{}': {}".format(topic, e))
 
     def loginfo(self, text):
         self.get_logger().info(text)
@@ -222,6 +240,7 @@ class TcpServer(Node):
 class SysCommands:
     def __init__(self, tcp_server):
         self.tcp_server = tcp_server
+        self.current_client = None  # 현재 요청을 처리 중인 클라이언트
 
     def subscribe(self, topic, message_name):
         if topic == "":
@@ -338,12 +357,14 @@ class SysCommands:
         self.tcp_server.loginfo("RegisterUnityService({}, {}) OK".format(topic, message_class))
 
     def response(self, srv_id):  # the next message is a service response
-        self.tcp_server.pending_srv_id = srv_id
-        self.tcp_server.pending_srv_is_request = False
+        if self.current_client is not None:
+            self.current_client.pending_srv_id = srv_id
+            self.current_client.pending_srv_is_request = False
 
     def request(self, srv_id):  # the next message is a service request
-        self.tcp_server.pending_srv_id = srv_id
-        self.tcp_server.pending_srv_is_request = True
+        if self.current_client is not None:
+            self.current_client.pending_srv_id = srv_id
+            self.current_client.pending_srv_is_request = True
 
     def topic_list(self):
         self.tcp_server.unity_tcp_sender.send_topic_list()
@@ -354,20 +375,14 @@ class SysCommands:
             module_name = names[0]
             class_name = names[1]
             importlib.import_module(module_name + "." + extension)
-            module = sys.modules[module_name]
+            module = sys.modules.get(module_name)
             if module is None:
                 self.tcp_server.logerr("Failed to resolve module {}".format(module_name))
+                return None
+            # getattr은 속성 없으면 AttributeError 발생 (except에서 처리)
             module = getattr(module, extension)
-            if module is None:
-                self.tcp_server.logerr(
-                    "Failed to resolve module {}.{}".format(module_name, extension)
-                )
-            module = getattr(module, class_name)
-            if module is None:
-                self.tcp_server.logerr(
-                    "Failed to resolve module {}.{}.{}".format(module_name, extension, class_name)
-                )
-            return module
+            message_class = getattr(module, class_name)
+            return message_class
         except (IndexError, KeyError, AttributeError, ImportError) as e:
             self.tcp_server.logerr("Failed to resolve message name: {}".format(e))
             return None

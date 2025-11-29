@@ -53,7 +53,6 @@ class RosSubscriber(RosReceiver):
         self.subscription = self.create_subscription(
             self.msg, self.topic, self.send, qos_profile  # queue_size
         )
-        self.subscription
 
     def send(self, data):
         """

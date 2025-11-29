@@ -43,6 +43,9 @@ class ClientThread(threading.Thread):
         self.tcp_server = tcp_server
         self.incoming_ip = incoming_ip
         self.incoming_port = incoming_port
+        # 클라이언트별 서비스 요청 상태 (race condition 방지)
+        self.pending_srv_id = None
+        self.pending_srv_is_request = False
         threading.Thread.__init__(self)
 
     @staticmethod
@@ -88,6 +91,9 @@ class ClientThread(threading.Thread):
 
         return decoded_str
 
+    # 최대 메시지 크기 (100MB) - 메모리 공격 방지
+    MAX_MESSAGE_SIZE = 100 * 1024 * 1024
+
     def read_message(self, conn):
         """
         Decode destination and full message size from socket connection.
@@ -98,11 +104,20 @@ class ClientThread(threading.Thread):
         destination = self.read_string()
         full_message_size = ClientThread.read_int32(conn)
 
+        # 메시지 크기 검증
+        if full_message_size > self.MAX_MESSAGE_SIZE:
+            self.tcp_server.logerr(
+                "Message too large: {} bytes (max: {} bytes)".format(
+                    full_message_size, self.MAX_MESSAGE_SIZE
+                )
+            )
+            return None
+
         data = ClientThread.recvall(conn, full_message_size)
 
         if full_message_size > 0 and not data:
-            self.logerr("No data for a message size of {}, breaking!".format(full_message_size))
-            return
+            self.tcp_server.logerr("No data for a message size of {}, breaking!".format(full_message_size))
+            return None
 
         destination = destination.rstrip("\x00")
         return destination, data
@@ -191,26 +206,29 @@ class ClientThread(threading.Thread):
         self.tcp_server.unity_tcp_sender.start_sender(self.conn, halt_event)
         try:
             while not halt_event.is_set():
-                destination, data = self.read_message(self.conn)
+                result = self.read_message(self.conn)
+                if result is None:
+                    break
+                destination, data = result
 
                 # Process this message that was sent from Unity
-                if self.tcp_server.pending_srv_id is not None:
+                if self.pending_srv_id is not None:
                     # if we've been told that the next message will be a service request/response, process it as such
-                    if self.tcp_server.pending_srv_is_request:
+                    if self.pending_srv_is_request:
                         self.send_ros_service_request(
-                            self.tcp_server.pending_srv_id, destination, data
+                            self.pending_srv_id, destination, data
                         )
                     else:
                         self.tcp_server.send_unity_service_response(
-                            self.tcp_server.pending_srv_id, data
+                            self.pending_srv_id, data
                         )
-                    self.tcp_server.pending_srv_id = None
+                    self.pending_srv_id = None
                 elif destination == "":
                     # ignore this keepalive message, listen for more
                     pass
                 elif destination.startswith("__"):
                     # handle a system command, such as registering new topics
-                    self.tcp_server.handle_syscommand(destination, data)
+                    self.tcp_server.handle_syscommand(destination, data, self)
                 elif destination in self.tcp_server.publishers_table:
                     ros_communicator = self.tcp_server.publishers_table[destination]
                     ros_communicator.send(data)
