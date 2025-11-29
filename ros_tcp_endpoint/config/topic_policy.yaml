@@ -10,7 +10,7 @@ topic_policies:
   # 예시: 고주파 센서 토픽 - 최신 값만 유지
   /joint_states:
     policy: latest_only
-    max_frequency: 100
+    max_frequency: 15
 
   # /camera/image_raw:
   #   policy: latest_only
