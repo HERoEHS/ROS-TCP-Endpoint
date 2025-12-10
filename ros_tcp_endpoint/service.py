@@ -55,7 +55,15 @@ class RosService(RosSender):
             service response
         """
         message_type = type(self.req)
-        message = deserialize_message(data, message_type)
+        # Unity ROS-TCP-Connector sends ROS2 CDR header (4 bytes: 0x00, 0x01, 0x00, 0x00)
+        # rclpy.deserialize_message expects raw payload without this header
+        if len(data) >= 4 and data[:4] == b'\x00\x01\x00\x00':
+            data = data[4:]
+        # Empty request (0 bytes, e.g. std_srvs/Trigger) - create instance directly
+        if len(data) == 0:
+            message = message_type()
+        else:
+            message = deserialize_message(data, message_type)
 
         if not self.cli.service_is_ready():
             self.get_logger().error(
