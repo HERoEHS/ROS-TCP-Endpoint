@@ -54,12 +54,9 @@ class RosPublisher(RosSender):
             None: Explicitly return None so behaviour can be
         """
         message_type = type(self.msg)
-        # Unity ROS-TCP-Connector sends ROS2 CDR header (4 bytes: 0x00, 0x01, 0x00, 0x00)
-        # rclpy.deserialize_message expects raw payload without this header
-        if len(data) >= 4 and data[:4] == b'\x00\x01\x00\x00':
-            data = data[4:]
-        # Empty message (0 bytes) - create instance directly
-        if len(data) == 0:
+        # rclpy.deserialize_message expects CDR header included
+        # Empty message = only CDR header (4 bytes: 0x00, 0x01, 0x00, 0x00)
+        if data == b'\x00\x01\x00\x00':
             message = message_type()
         else:
             message = deserialize_message(data, message_type)
