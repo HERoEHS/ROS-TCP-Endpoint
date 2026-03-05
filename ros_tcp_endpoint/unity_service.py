@@ -15,6 +15,7 @@
 import rclpy
 import socket
 import re
+import uuid
 
 from .communication import RosReceiver
 from .client import ClientThread
@@ -34,7 +35,8 @@ class UnityService(RosReceiver):
             queue_size:    Max number of entries to maintain in an outgoing queue
         """
         strippedTopic = re.sub("[^A-Za-z0-9_]+", "", topic)
-        node_name = f"{strippedTopic}_service"
+        unique_suffix = uuid.uuid4().hex[:8]
+        node_name = f"{strippedTopic}_UnityService_{unique_suffix}"
         RosReceiver.__init__(self, node_name)
 
         self.topic = topic
@@ -58,8 +60,9 @@ class UnityService(RosReceiver):
 
     def unregister(self):
         """
-
-        Returns:
-
+        Clean up the service before destroying the node.
         """
+        if self.service is not None:
+            self.destroy_service(self.service)
+            self.service = None
         self.destroy_node()

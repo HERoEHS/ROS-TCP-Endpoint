@@ -1,0 +1,33 @@
+# ROS-TCP-Endpoint 토픽별 전송 정책 설정
+#
+# policy 옵션:
+#   - "queue": 모든 메시지를 큐에 저장 (기본값, 손실 없음)
+#   - "latest_only": 최신 메시지만 유지 (고주파 센서용, 메모리 절약)
+#
+# max_frequency: Hz 단위 스로틀링 (선택, 0 = 무제한)
+
+topic_policies:
+  # 예시: 고주파 센서 토픽 - 최신 값만 유지
+  /joint_states:
+    policy: latest_only
+    max_frequency: 15
+
+  # /camera/image_raw:
+  #   policy: latest_only
+  #   max_frequency: 30
+
+  # /scan:
+  #   policy: latest_only
+  #   max_frequency: 20
+
+  # 예시: 이벤트성 토픽 - 큐 유지 (손실 방지)
+  # /goal_reached:
+  #   policy: queue
+
+  # /button_event:
+  #   policy: queue
+
+# 기본 정책 (설정에 없는 토픽에 적용)
+default_policy:
+  policy: queue
+  max_queue_size: 100

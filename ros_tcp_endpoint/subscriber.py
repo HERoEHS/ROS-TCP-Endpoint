@@ -15,6 +15,7 @@
 import rclpy
 import socket
 import re
+import uuid
 
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSReliabilityPolicy
 from rclpy.qos import QoSProfile
@@ -36,12 +37,14 @@ class RosSubscriber(RosReceiver):
             queue_size:    Max number of entries to maintain in an outgoing queue
         """
         strippedTopic = re.sub("[^A-Za-z0-9_]+", "", topic)
-        self.node_name = f"{strippedTopic}_RosSubscriber"
+        unique_suffix = uuid.uuid4().hex[:8]
+        self.node_name = f"{strippedTopic}_RosSubscriber_{unique_suffix}"
         RosReceiver.__init__(self, self.node_name)
         self.topic = topic
         self.msg = message_class
         self.tcp_server = tcp_server
         self.queue_size = queue_size
+        self._is_unregistered = False
 
         qos_profile = QoSProfile(depth=queue_size,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -52,7 +55,6 @@ class RosSubscriber(RosReceiver):
         self.subscription = self.create_subscription(
             self.msg, self.topic, self.send, qos_profile  # queue_size
         )
-        self.subscription
 
     def send(self, data):
         """
@@ -64,14 +66,23 @@ class RosSubscriber(RosReceiver):
             self.msg: The deserialize message
 
         """
+        if self._is_unregistered:
+            return self.msg
+
         self.tcp_server.send_unity_message(self.topic, data)
         return self.msg
 
     def unregister(self):
         """
-
-        Returns:
-
+        Safely unregister the subscriber.
+        destroy_node()는 server.py의 unregister_node()에서 별도로 호출됨.
         """
-        self.destroy_subscription(self.subscription)
-        self.destroy_node()
+        self._is_unregistered = True
+
+        try:
+            if self.subscription is not None:
+                self.destroy_subscription(self.subscription)
+                self.subscription = None
+        except Exception as e:
+            if self.tcp_server:
+                self.tcp_server.logerr(f"Error destroying subscription for {self.topic}: {e}")

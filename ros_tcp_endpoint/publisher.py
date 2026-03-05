@@ -14,6 +14,7 @@
 
 import rclpy
 import re
+import uuid
 
 from rclpy.serialization import deserialize_message
 
@@ -35,7 +36,8 @@ class RosPublisher(RosSender):
             queue_size:    Max number of entries to maintain in an outgoing queue
         """
         strippedTopic = re.sub("[^A-Za-z0-9_]+", "", topic)
-        node_name = f"{strippedTopic}_RosPublisher"
+        unique_suffix = uuid.uuid4().hex[:8]
+        node_name = f"{strippedTopic}_RosPublisher_{unique_suffix}"
         RosSender.__init__(self, node_name)
         self.msg = message_class()
         self.pub = self.create_publisher(message_class, topic, queue_size)
@@ -51,10 +53,14 @@ class RosPublisher(RosSender):
         Returns:
             None: Explicitly return None so behaviour can be
         """
-        # message_type = type(self.msg)
-        # message = deserialize_message(data, message_type)
-
-        self.pub.publish(data)
+        message_type = type(self.msg)
+        # rclpy.deserialize_message expects CDR header included
+        # Empty message = only CDR header (4 bytes: 0x00, 0x01, 0x00, 0x00)
+        if data == b'\x00\x01\x00\x00':
+            message = message_type()
+        else:
+            message = deserialize_message(data, message_type)
+        self.pub.publish(message)
 
         return None
 
