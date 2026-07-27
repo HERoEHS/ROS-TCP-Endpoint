@@ -238,9 +238,16 @@ class ClientThread(threading.Thread):
                     )
                     self.tcp_server.send_unity_error(error_msg)
                     self.tcp_server.logerr(error_msg)
-        except IOError as e:
-            self.tcp_server.logerr("Exception: {}".format(e))
+        except (IOError, OSError) as e:
+            # OFF 전환/종료로 소켓이 닫혀 발생하는 예외는 로그를 억제한다(tcp_enabled 일 때만 로깅).
+            if self.tcp_server.tcp_enabled:
+                self.tcp_server.logerr("Exception: {}".format(e))
         finally:
             halt_event.set()
-            self.conn.close()
+            try:
+                self.conn.close()
+            except OSError:
+                pass
+            # 상태 목록(_client_sockets)에서 이 연결 제거 → gui status 반영.
+            self.tcp_server.unregister_client(self.conn)
             self.tcp_server.loginfo("Disconnected from {}".format(self.incoming_ip))
