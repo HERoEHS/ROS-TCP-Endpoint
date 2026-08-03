@@ -242,6 +242,16 @@ class ClientThread(threading.Thread):
             # OFF 전환/종료로 소켓이 닫혀 발생하는 예외는 로그를 억제한다(tcp_enabled 일 때만 로깅).
             if self.tcp_server.tcp_enabled:
                 self.tcp_server.logerr("Exception: {}".format(e))
+        except (struct.error, UnicodeDecodeError, ValueError) as e:
+            # 손상/절단된 프레임. 길이 헤더를 신뢰할 수 없어 스트림 동기를 되찾을 수 없으므로
+            # 연결을 끊고 클라이언트의 재접속을 기다린다. (종전에는 스레드가 조용히 죽어
+            # 원인 없이 "연결이 끊겼다"로만 보였다.)
+            self.tcp_server.logerr("Malformed frame from {} — closing connection: {}".format(
+                self.incoming_ip, e))
+        except Exception as e:
+            # 메시지 처리 중 예기치 못한 예외로 수신 스레드가 통째로 죽는 것을 막는다.
+            self.tcp_server.logerr("Unexpected error handling client {}: {}".format(
+                self.incoming_ip, e))
         finally:
             halt_event.set()
             try:

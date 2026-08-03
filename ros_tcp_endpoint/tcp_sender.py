@@ -30,9 +30,11 @@ from .thread_pauser import ThreadPauser
 try:
     from queue import Queue
     from queue import Empty
+    from queue import Full
 except:
     from Queue import Queue
     from Queue import Empty
+    from Queue import Full
 
 # YAML 로드 (선택적)
 try:
@@ -70,6 +72,10 @@ class UnityTcpSender:
         self.latest_lock = threading.Lock()
         self.last_send_time = {}  # {topic: timestamp} for throttling
 
+        # 송신 큐 백프레셔 통계(가득 찬 큐에서 버린 토픽 메시지 수). 5초 간격으로만 로그한다.
+        self.dropped_messages = 0
+        self._last_drop_log_time = 0.0
+
         # 설정 파일 로드
         if config_path:
             self._load_config(config_path)
@@ -100,11 +106,63 @@ class UnityTcpSender:
         """토픽별 정책 반환"""
         return self.topic_policies.get(topic, self.default_policy)
 
-    def _broadcast_to_all_clients(self, data):
-        """모든 연결된 클라이언트에게 메시지 전송"""
+    def _queue_maxsize(self):
+        """클라이언트 송신 큐 상한(항목 수). 0 이하 = 무제한.
+
+        default_policy.max_queue_size 를 실제 Queue 상한으로 쓴다(종전에는 설정만 있고
+        Queue() 가 무제한이라 값이 사용되지 않았다). 상한이 없으면 링크가 느려질 때 큐가
+        끝없이 쌓여 (a) 조종 단말이 수 초 뒤처진 상태를 보고 (b) 메모리가 늘고
+        (c) sendall 이 오래 블록해 연결이 죽은 것처럼 보인다.
+        """
+        try:
+            return max(0, int(self.default_policy.get('max_queue_size', 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _broadcast_to_all_clients(self, data, droppable=False):
+        """모든 연결된 클라이언트에게 메시지 전송.
+
+        droppable=True (토픽 메시지): 큐가 가득 차면 가장 오래된 항목을 버리고 최신을 넣는다.
+            오래된 상태 메시지는 최신 것으로 대체 가능하므로, 버리는 편이 링크를 살리는 데 유리하다.
+        droppable=False (제어 메시지: 로그·서비스 응답·토픽 목록): 버리지 않되 무한 대기도 하지
+            않는다. 큐에 상한이 있으면 순수 put() 은 호출 스레드(ROS 콜백 등)를 붙잡을 수 있다.
+        """
         with self.queues_lock:
-            for queue in self.queues.values():
-                queue.put(data)
+            queues = list(self.queues.values())
+
+        dropped = 0
+        for queue in queues:
+            if not droppable:
+                try:
+                    queue.put(data, timeout=1.0)
+                except Full:
+                    self.tcp_server.logwarn("Send queue full — control message dropped")
+                continue
+
+            try:
+                queue.put_nowait(data)
+                continue
+            except Full:
+                pass
+            try:
+                queue.get_nowait()          # 가장 오래된 항목 폐기
+            except Empty:
+                pass
+            try:
+                queue.put_nowait(data)
+            except Full:
+                pass                        # 그 사이 다른 스레드가 채웠다면 이번 항목을 버린다
+            dropped += 1
+
+        if dropped:
+            self.dropped_messages += dropped
+            now = time.time()
+            if now - self._last_drop_log_time >= 5.0:
+                self._last_drop_log_time = now
+                self.tcp_server.logwarn(
+                    "Send queue full — dropped {} message(s) so far (link too slow "
+                    "or client stalled)".format(self.dropped_messages)
+                )
 
     def send_unity_info(self, text):
         command = SysCommand_Log()
@@ -153,7 +211,7 @@ class UnityTcpSender:
                     return  # 스킵
                 self.last_send_time[topic] = now
 
-            self._broadcast_to_all_clients(serialized_message)
+            self._broadcast_to_all_clients(serialized_message, droppable=True)
 
     def send_unity_service_request(self, topic, service_class, request):
         # 연결된 클라이언트가 없으면 실패
@@ -241,7 +299,8 @@ class UnityTcpSender:
         sender_thread.start()
 
     def sender_loop(self, conn, tid, halt_event):
-        local_queue = Queue()
+        # 상한 초과 시 _broadcast_to_all_clients 가 오래된 토픽 메시지를 버린다(0=무제한).
+        local_queue = Queue(maxsize=self._queue_maxsize())
         # 이 클라이언트가 마지막으로 보낸 latest_only 메시지 추적
         last_sent = {}  # {topic: serialized_message}
 
@@ -299,7 +358,10 @@ class UnityTcpSender:
                 try:
                     conn.sendall(item)
                 except Exception as e:
-                    self.tcp_server.logerr("Exception {}".format(e))
+                    # 소켓이 깨진 상태(피어 리셋/keepalive 만료 등). 스트림 중간에서 실패하면
+                    # 프레임 경계를 복구할 수 없으므로 재시도하지 않고 연결을 정리한다
+                    # (클라이언트가 재접속하면 새 세션으로 깨끗하게 시작한다).
+                    self.tcp_server.logerr("Send failed, closing connection: {}".format(e))
                     break
         finally:
             halt_event.set()
