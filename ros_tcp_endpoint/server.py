@@ -16,8 +16,6 @@ import rclpy
 import socket
 import json
 import sys
-import os
-import re
 import threading
 import importlib
 
@@ -118,8 +116,8 @@ class TcpServer(Node):
         self.client_threads = []
         self.client_threads_lock = threading.Lock()
 
-        # TCP 통신 토글: 기본은 OFF(포트를 열지 않음). set_tcp_enabled(True) 시에만 bind/accept.
-        # 노드/서비스는 항상 살아 있고, 외부(gui SetBool) 또는 mobile 자동 로직이 켠다.
+        # TCP 통신 토글: 노드 시작 시 자동으로 ON(start 에서 set_tcp_enabled(True)).
+        # 이후 외부(gui SetBool)로 끄고 켤 수 있다.
         self._tcp_enabled = threading.Event()
         self._socket_lock = threading.Lock()
         self._client_lock = threading.Lock()
@@ -144,9 +142,6 @@ class TcpServer(Node):
             SetBool, "/ros_tcp_endpoint/set_enabled", self._set_enabled_callback
         )
 
-        # mobile(alice_m{N}) 세대는 gui 없이 코드가 자동으로 TCP 를 켠다(start 에서 set_tcp_enabled).
-        # 휴머노이드(alice4/5)는 기본 OFF 로 두고 gui 토글로 켠다.
-        self._auto_enable = bool(re.match(r"^alice_m[0-9]+$", os.environ.get("ALICE_GENERATION", "")))
 
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
@@ -158,9 +153,8 @@ class TcpServer(Node):
         # Exit the server thread when the main thread terminates
         self._server_thread.daemon = True
         self._server_thread.start()
-        # mobile: 코드가 자동으로 TCP 를 켠다(gui 대신). 실패해도 노드는 계속 살아 있다.
-        if self._auto_enable:
-            self.set_tcp_enabled(True)
+        # 노드 시작 시 항상 TCP 를 켠다. 실패해도 노드는 계속 살아 있다(gui 로 재시도 가능).
+        self.set_tcp_enabled(True)
 
     # ─── TCP toggle (gui SetBool / mobile 자동으로 on/off) ──────────────────────
     @property
