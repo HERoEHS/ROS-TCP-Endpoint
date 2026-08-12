@@ -241,13 +241,23 @@ class TcpServer(Node):
             self.logwarn("Failed to apply socket options: {}".format(exc))
 
     def _drop_other_clients(self, keep_conn):
-        """SINGLE_CLIENT 모드: 새로 받은 연결만 남기고 이전 연결을 정리한다.
+        """SINGLE_CLIENT 모드: 같은 단말(동일 IP)의 이전 연결만 정리한다.
 
         조종 단말이 재접속했는데 이전 세션이 좀비로 남아 있으면 송신 큐가 죽은 소켓 쪽으로
         갈라지고(마지막 sender 가 self.queue 를 차지) status/connected 신호도 실제와 어긋난다.
+
+        단, vr(HMD)·joystick 처럼 서로 다른 단말이 각기 다른 IP 로 동시에 붙을 수 있으므로
+        '모든' 다른 연결이 아니라 keep_conn 과 같은 IP 의 이전 연결만 끊는다. 다른 IP 를 끊으면
+        단말끼리 서로 밀어내며(accept 마다 상대를 종료 → 상대가 재접속 → 다시 종료) 접속이
+        무한히 깜빡인다. 재접속 좀비 세션 정리라는 원 목적은 동일 IP 만 대상으로도 달성된다.
         """
         with self._client_lock:
-            stale = [c for c in self._client_sockets.keys() if c is not keep_conn]
+            keep_info = self._client_sockets.get(keep_conn)
+            keep_ip = keep_info["ip"] if keep_info else None
+            stale = [
+                c for c, info in self._client_sockets.items()
+                if c is not keep_conn and keep_ip is not None and info["ip"] == keep_ip
+            ]
             for conn in stale:
                 self._client_sockets.pop(conn, None)
         for conn in stale:
