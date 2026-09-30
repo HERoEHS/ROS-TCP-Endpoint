@@ -123,6 +123,7 @@ class TcpServer(Node):
         self._client_lock = threading.Lock()
         self._client_sockets = {}
         self._server_thread = None
+        self._started = False
 
         status_qos = QoSProfile(
             depth=1,
@@ -144,6 +145,11 @@ class TcpServer(Node):
 
 
     def start(self, publishers=None, subscribers=None):
+        # Claim the port BEFORE publishing status or starting background work.
+        # A duplicate process must not stay alive with the same ROS services or
+        # publish connected=False while the real endpoint is controlling a robot.
+        self._open_server_socket()
+        self._started = True
         if publishers is not None:
             self.publishers_table = publishers
         if subscribers is not None:
@@ -153,7 +159,7 @@ class TcpServer(Node):
         # Exit the server thread when the main thread terminates
         self._server_thread.daemon = True
         self._server_thread.start()
-        # 노드 시작 시 항상 TCP 를 켠다. 실패해도 노드는 계속 살아 있다(gui 로 재시도 가능).
+        # 초기 bind 실패는 start()에서 종료한다. 실행 중 GUI OFF/ON 재시도는 유지한다.
         self.set_tcp_enabled(True)
 
     # ─── TCP toggle (gui SetBool / mobile 자동으로 on/off) ──────────────────────
@@ -477,6 +483,8 @@ class TcpServer(Node):
         (기존 shutdown() 을 toggle 소켓 정리와 통합한 것.)
         """
         self.loginfo("Initiating graceful shutdown...")
+        if not self._started:
+            return
         self.shutdown_event.set()
         self._tcp_enabled.clear()
         self._close_server_socket()
@@ -536,6 +544,12 @@ class SysCommands:
             return
 
         old_node = self.tcp_server.subscribers_table.get(topic)
+        if old_node is not None and old_node.msg is message_class:
+            # Unity repeats registration on reconnect/start. Rebuilding an
+            # identical entity sleeps twice in unregister_node and blocks ALL
+            # incoming topics on this connection (including controller poses).
+            self.tcp_server.loginfo("RegisterSubscriber({}) unchanged; reused".format(topic))
+            return
         if old_node is not None:
             self.tcp_server.unregister_node(old_node)
 
@@ -563,6 +577,10 @@ class SysCommands:
             return
 
         old_node = self.tcp_server.publishers_table.get(topic)
+        if (old_node is not None and type(old_node.msg) is message_class
+                and old_node.queue_size == queue_size and old_node.latch == latch):
+            self.tcp_server.loginfo("RegisterPublisher({}) unchanged; reused".format(topic))
+            return
         if old_node is not None:
             self.tcp_server.unregister_node(old_node)
 

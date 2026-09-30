@@ -1,16 +1,28 @@
 # ROS-TCP-Endpoint 토픽별 전송 정책 설정
 #
 # policy 옵션:
-#   - "queue": 모든 메시지를 큐에 저장 (기본값, 손실 없음)
+#   - "queue": 메시지를 순서대로 큐에 저장 (포화 시 오래된 토픽 메시지 폐기)
 #   - "latest_only": 최신 메시지만 유지 (고주파 센서용, 메모리 절약)
 #
 # max_frequency: Hz 단위 스로틀링 (선택, 0 = 무제한)
+# max_age: latest_only 스냅샷의 송신 대기 수명 [s] (선택, 0 = 제한 없음)
 
 topic_policies:
   # 예시: 고주파 센서 토픽 - 최신 값만 유지
   /joint_states:
     policy: latest_only
     max_frequency: 15
+
+  # HMD 영상은 오래된 프레임 100개를 재생하지 않는다. 느린 링크에서는
+  # 좌/우 각각 최신 프레임만 유지한다(서비스/제어 이벤트 큐와 분리).
+  /aeirobot/alice/vr/left_image:
+    policy: latest_only
+    max_frequency: 30
+    max_age: 0.25
+  /aeirobot/alice/vr/right_image:
+    policy: latest_only
+    max_frequency: 30
+    max_age: 0.25
 
   # /camera/image_raw:
   #   policy: latest_only
@@ -20,7 +32,7 @@ topic_policies:
   #   policy: latest_only
   #   max_frequency: 20
 
-  # 예시: 이벤트성 토픽 - 큐 유지 (손실 방지)
+  # 예시: 이벤트성 토픽 - 순서대로 큐 유지 (포화 시 토픽 메시지 폐기 가능)
   # /goal_reached:
   #   policy: queue
 

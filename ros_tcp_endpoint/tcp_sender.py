@@ -25,16 +25,9 @@ from rclpy.serialization import serialize_message
 
 from .client import ClientThread
 from .thread_pauser import ThreadPauser
+from .outbound_queue import OutboundQueue
 
-# queue module was renamed between python 2 and 3
-try:
-    from queue import Queue
-    from queue import Empty
-    from queue import Full
-except:
-    from Queue import Queue
-    from Queue import Empty
-    from Queue import Full
+from queue import Empty
 
 # YAML 로드 (선택적)
 try:
@@ -122,41 +115,33 @@ class UnityTcpSender:
     def _broadcast_to_all_clients(self, data, droppable=False):
         """모든 연결된 클라이언트에게 메시지 전송.
 
-        droppable=True (토픽 메시지): 큐가 가득 차면 가장 오래된 항목을 버리고 최신을 넣는다.
+        droppable=True (토픽 메시지): 큐가 가득 차면 가장 오래된 폐기 가능한 항목을 교체한다.
             오래된 상태 메시지는 최신 것으로 대체 가능하므로, 버리는 편이 링크를 살리는 데 유리하다.
-        droppable=False (제어 메시지: 로그·서비스 응답·토픽 목록): 버리지 않되 무한 대기도 하지
-            않는다. 큐에 상한이 있으면 순수 put() 은 호출 스레드(ROS 콜백 등)를 붙잡을 수 있다.
+        droppable=False (제어 메시지: 로그·서비스 응답·토픽 목록): 기존 데이터 항목을 먼저
+            폐기한다. 제어 메시지만으로 가득 차면 해당 연결을 종료하고 재접속으로 복구한다.
         """
         with self.queues_lock:
             queues = list(self.queues.values())
 
         dropped = 0
         for queue in queues:
-            if not droppable:
+            accepted, lost = queue.offer(data, droppable)
+            dropped += lost
+            if not accepted and not droppable:
+                # A missing __response/header would corrupt protocol pairing.
+                # Disconnect this stalled client; never silently drop control,
+                # and never block the TCP input or ROS executor for a second.
+                self.tcp_server.logwarn('Control send queue full; disconnecting stalled client')
+                queue.halt_event.set()
+                queue.wake.set()
                 try:
-                    queue.put(data, timeout=1.0)
-                except Full:
-                    self.tcp_server.logwarn("Send queue full — control message dropped")
-                continue
-
-            try:
-                queue.put_nowait(data)
-                continue
-            except Full:
-                pass
-            try:
-                queue.get_nowait()          # 가장 오래된 항목 폐기
-            except Empty:
-                pass
-            try:
-                queue.put_nowait(data)
-            except Full:
-                pass                        # 그 사이 다른 스레드가 채웠다면 이번 항목을 버린다
-            dropped += 1
+                    queue.conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
         if dropped:
             self.dropped_messages += dropped
-            now = time.time()
+            now = time.monotonic()
             if now - self._last_drop_log_time >= 5.0:
                 self._last_drop_log_time = now
                 self.tcp_server.logwarn(
@@ -199,12 +184,16 @@ class UnityTcpSender:
         if is_latest_only:
             # latest_only: 항상 최신 값 저장 (스로틀링과 무관)
             with self.latest_lock:
-                self.latest_messages[topic] = serialized_message
+                self.latest_messages[topic] = (serialized_message, time.monotonic())
+            with self.queues_lock:
+                queues = list(self.queues.values())
+            for queue in queues:
+                queue.wake.set()
         else:
             # 큐 방식: 스로틀링 체크 후 브로드캐스트
             max_freq = policy.get('max_frequency', 0)
             if max_freq > 0:
-                now = time.time()
+                now = time.monotonic()
                 min_interval = 1.0 / max_freq
                 last_time = self.last_send_time.get(topic, 0)
                 if now - last_time < min_interval:
@@ -297,17 +286,19 @@ class UnityTcpSender:
         # Exit the server thread when the main thread terminates
         sender_thread.daemon = True
         sender_thread.start()
+        return sender_thread
 
     def sender_loop(self, conn, tid, halt_event):
         # 상한 초과 시 _broadcast_to_all_clients 가 오래된 토픽 메시지를 버린다(0=무제한).
-        local_queue = Queue(maxsize=self._queue_maxsize())
+        local_queue = OutboundQueue(self._queue_maxsize(), conn, halt_event)
         # 이 클라이언트가 마지막으로 보낸 latest_only 메시지 추적
         last_sent = {}  # {topic: serialized_message}
 
         # send a handshake message to confirm the connection and version number
         handshake_metadata = SysCommand_Handshake_Metadata()
         handshake = SysCommand_Handshake(handshake_metadata)
-        local_queue.put(ClientThread.serialize_command("__handshake", handshake))
+        # Send handshake before any cached latest-only topics on reconnect.
+        handshake_bytes = ClientThread.serialize_command("__handshake", handshake)
 
         # 클라이언트 큐 등록
         with self.queues_lock:
@@ -319,27 +310,46 @@ class UnityTcpSender:
         last_sent_time = {}  # {topic: timestamp}
 
         try:
+            conn.sendall(handshake_bytes)
             while not halt_event.is_set():
-                now = time.time()
+                # Clear BEFORE inspecting both work sources to avoid losing a
+                # notification between the snapshot and Event.wait().
+                local_queue.wake.clear()
+                next_due = .1
+                sent = False
+
+                # Protocol/queued events take precedence over camera snapshots.
+                try:
+                    conn.sendall(local_queue.get_nowait())
+                    sent = True
+                except Empty:
+                    pass
 
                 # 1. latest_only 토픽들의 최신 메시지 전송
                 with self.latest_lock:
                     latest_copy = dict(self.latest_messages)
 
-                for topic, msg in latest_copy.items():
+                for topic, snapshot in latest_copy.items():
+                    msg, received_at = snapshot
                     # 이전에 보낸 메시지와 다를 때만 전송
-                    if last_sent.get(topic) is not msg:
+                    if last_sent.get(topic) is not snapshot:
                         # 스로틀링 체크
                         policy = self._get_policy(topic)
+                        now = time.monotonic()
+                        max_age = policy.get('max_age', 0)
+                        if max_age > 0 and now - received_at > max_age:
+                            continue
                         max_freq = policy.get('max_frequency', 0)
                         if max_freq > 0:
                             min_interval = 1.0 / max_freq
                             if now - last_sent_time.get(topic, 0) < min_interval:
+                                next_due = min(next_due, min_interval - (now - last_sent_time.get(topic, 0)))
                                 continue  # 이 토픽은 스킵
 
                         try:
                             conn.sendall(msg)
-                            last_sent[topic] = msg
+                            sent = True
+                            last_sent[topic] = snapshot
                             last_sent_time[topic] = now
                         except Exception as e:
                             self.tcp_server.logerr(f"Exception sending latest message: {e}")
@@ -349,20 +359,11 @@ class UnityTcpSender:
                 if halt_event.is_set():
                     break
 
-                # 2. 큐에서 메시지 가져오기 (짧은 타임아웃)
-                try:
-                    item = local_queue.get(timeout=0.01)  # 10ms 타임아웃 (더 빠른 반응)
-                except Empty:
-                    continue
-
-                try:
-                    conn.sendall(item)
-                except Exception as e:
-                    # 소켓이 깨진 상태(피어 리셋/keepalive 만료 등). 스트림 중간에서 실패하면
-                    # 프레임 경계를 복구할 수 없으므로 재시도하지 않고 연결을 정리한다
-                    # (클라이언트가 재접속하면 새 세션으로 깨끗하게 시작한다).
-                    self.tcp_server.logerr("Send failed, closing connection: {}".format(e))
-                    break
+                if not sent:
+                    local_queue.wake.wait(timeout=max(0., next_due))
+        except OSError as exc:
+            if not halt_event.is_set():
+                self.tcp_server.logerr('Send failed, closing connection: {}'.format(exc))
         finally:
             halt_event.set()
             # 클라이언트 큐 해제

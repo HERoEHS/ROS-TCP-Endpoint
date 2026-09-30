@@ -14,7 +14,14 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/) a
 
 Added Sonarqube scanner
 
+- Rate-limited teleop transport timing and tests for burst input, service ordering,
+  output backpressure and optional M2 watchdog integration.
+
 ### Changed
+
+- Coalesce allowlisted continuous teleop state within available TCP batches and
+  expire locally queued state after 100 ms; keep command/service ordering.
+- Wake outgoing senders on updates and retain only recent left/right VR images.
 
 ### Deprecated
 
@@ -22,6 +29,11 @@ Added Sonarqube scanner
 
 ### Fixed
 
+- Reuse identical Unity topic registrations without blocking the input reader.
+- Preserve protocol messages under output backpressure and close stalled clients
+  rather than blocking input dispatch.
+- Exit on initial port-bind failure without leaving an inactive endpoint running.
+- Send the handshake before cached state and clean up sender threads on disconnect.
 
 ## [0.7.0] - 2022-02-01
 
