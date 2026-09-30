@@ -19,6 +19,7 @@ import uuid
 from rclpy.serialization import deserialize_message
 
 from .communication import RosSender
+from .framed_input import LATEST_INPUT_TOPICS
 
 
 class RosPublisher(RosSender):
@@ -40,7 +41,12 @@ class RosPublisher(RosSender):
         node_name = f"{strippedTopic}_RosPublisher_{unique_suffix}"
         RosSender.__init__(self, node_name)
         self.msg = message_class()
-        self.pub = self.create_publisher(message_class, topic, queue_size)
+        self.queue_size = queue_size
+        self.latch = latch
+        # Keep reliability compatible with legacy teleop subscribers, but do not
+        # retain a DDS history of superseded real-time setpoints.
+        self.pub = self.create_publisher(message_class, topic,
+                                         1 if topic in LATEST_INPUT_TOPICS else queue_size)
 
     def send(self, data):
         """

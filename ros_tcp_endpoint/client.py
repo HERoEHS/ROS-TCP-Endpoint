@@ -14,6 +14,8 @@
 
 import rclpy
 import struct
+import socket
+import time
 
 import threading
 import json
@@ -22,6 +24,8 @@ from rclpy.serialization import deserialize_message
 from rclpy.serialization import serialize_message
 
 from .exceptions import TopicOrServiceNameDoesNotExistError
+from .input_timing import InputTiming
+from .framed_input import FrameReader, LATEST_INPUT_TOPICS, latest_frames
 
 
 class ClientThread(threading.Thread):
@@ -46,6 +50,9 @@ class ClientThread(threading.Thread):
         # 클라이언트별 서비스 요청 상태 (race condition 방지)
         self.pending_srv_id = None
         self.pending_srv_is_request = False
+        self.input_timing = InputTiming(incoming_ip, tcp_server.logwarn)
+        self.quickack = getattr(socket, 'TCP_QUICKACK', None)
+        self.reader = FrameReader(conn)
         threading.Thread.__init__(self)
 
     @staticmethod
@@ -186,6 +193,26 @@ class ClientThread(threading.Thread):
 
         self.tcp_server.unity_tcp_sender.send_ros_service_response(srv_id, destination, response)
 
+    def dispatch(self, destination, data):
+        """Dispatch one ordered frame, preserving service header/body pairing."""
+        if self.pending_srv_id is not None:
+            if self.pending_srv_is_request:
+                self.send_ros_service_request(self.pending_srv_id, destination, data)
+            else:
+                self.tcp_server.send_unity_service_response(self.pending_srv_id, data)
+            self.pending_srv_id = None
+        elif destination == '':
+            pass
+        elif destination.startswith('__'):
+            self.tcp_server.handle_syscommand(destination, data, self)
+        elif destination in self.tcp_server.publishers_table:
+            self.tcp_server.publishers_table[destination].send(data)
+        else:
+            error_msg = "Not registered to publish topic '{}'! Valid publish topics are: {} ".format(
+                destination, self.tcp_server.publishers_table.keys())
+            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.logerr(error_msg)
+
     def run(self):
         """
         Receive a message from Unity and determine where to send it based on the publishers table
@@ -203,41 +230,35 @@ class ClientThread(threading.Thread):
         """
         self.tcp_server.loginfo("Connection from {}".format(self.incoming_ip))
         halt_event = threading.Event()
-        self.tcp_server.unity_tcp_sender.start_sender(self.conn, halt_event)
+        sender_thread = self.tcp_server.unity_tcp_sender.start_sender(self.conn, halt_event)
         try:
             while not halt_event.is_set():
-                result = self.read_message(self.conn)
-                if result is None:
-                    break
-                destination, data = result
+                read_started = time.monotonic()
+                batch = self.reader.read_batch()
+                # NODELAY governs server writes only. Promptly ACK incoming small
+                # controller frames too; Linux QUICKACK is transient, so re-arm.
+                if self.quickack is not None:
+                    try:
+                        self.conn.setsockopt(socket.IPPROTO_TCP, self.quickack, 1)
+                    except OSError:
+                        self.quickack = None  # unsupported socket/platform; continue
 
-                # Process this message that was sent from Unity
-                if self.pending_srv_id is not None:
-                    # if we've been told that the next message will be a service request/response, process it as such
-                    if self.pending_srv_is_request:
-                        self.send_ros_service_request(
-                            self.pending_srv_id, destination, data
-                        )
+                selected = latest_frames(batch, self.pending_srv_id is not None)
+                self.input_timing.coalesced += len(batch) - len(selected)
+                for frame in selected:
+                    if halt_event.is_set() or self.conn.fileno() < 0:
+                        break
+                    processing_started = time.monotonic()
+                    # Only local residence time is known; do not pretend this is
+                    # the HMD sample age. Never replay a queued pose as a heartbeat.
+                    if (self.pending_srv_id is None and frame.destination in LATEST_INPUT_TOPICS
+                            and processing_started - frame.received_at > .1):
+                        self.input_timing.expired += 1
                     else:
-                        self.tcp_server.send_unity_service_response(
-                            self.pending_srv_id, data
-                        )
-                    self.pending_srv_id = None
-                elif destination == "":
-                    # ignore this keepalive message, listen for more
-                    pass
-                elif destination.startswith("__"):
-                    # handle a system command, such as registering new topics
-                    self.tcp_server.handle_syscommand(destination, data, self)
-                elif destination in self.tcp_server.publishers_table:
-                    ros_communicator = self.tcp_server.publishers_table[destination]
-                    ros_communicator.send(data)
-                else:
-                    error_msg = "Not registered to publish topic '{}'! Valid publish topics are: {} ".format(
-                        destination, self.tcp_server.publishers_table.keys()
-                    )
-                    self.tcp_server.send_unity_error(error_msg)
-                    self.tcp_server.logerr(error_msg)
+                        self.dispatch(frame.destination, frame.data)
+                    self.input_timing.record(frame.destination, read_started, frame.received_at,
+                                             time.monotonic(), processing_started)
+                    read_started = frame.received_at
         except (IOError, OSError) as e:
             # OFF 전환/종료로 소켓이 닫혀 발생하는 예외는 로그를 억제한다(tcp_enabled 일 때만 로깅).
             if self.tcp_server.tcp_enabled:
@@ -255,9 +276,14 @@ class ClientThread(threading.Thread):
         finally:
             halt_event.set()
             try:
+                self.conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 self.conn.close()
             except OSError:
                 pass
+            sender_thread.join(timeout=1.0)
             # 상태 목록(_client_sockets)에서 이 연결 제거 → gui status 반영.
             self.tcp_server.unregister_client(self.conn)
             self.tcp_server.loginfo("Disconnected from {}".format(self.incoming_ip))

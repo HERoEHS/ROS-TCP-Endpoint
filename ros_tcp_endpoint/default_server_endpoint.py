@@ -13,6 +13,9 @@ def main(args=None):
         tcp_server.setup_executor()
     except KeyboardInterrupt:
         pass
+    except OSError as exc:
+        tcp_server.logerr('TCP endpoint startup failed: {}. Stop the duplicate endpoint or use another port.'.format(exc))
+        raise SystemExit(1)
     finally:
         tcp_server.destroy_nodes()
         if rclpy.ok():
