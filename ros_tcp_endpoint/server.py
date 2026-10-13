@@ -377,6 +377,9 @@ class TcpServer(Node):
     def send_unity_message(self, topic, message):
         self.unity_tcp_sender.send_unity_message(topic, message)
 
+    def send_unity_serialized_message(self, topic, payload):
+        self.unity_tcp_sender.send_unity_serialized_message(topic, payload)
+
     def send_unity_service(self, topic, service_class, request):
         return self.unity_tcp_sender.send_unity_service_request(topic, service_class, request)
 

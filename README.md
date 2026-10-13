@@ -115,5 +115,37 @@ after a 279.6 ms transport gap (278.8 ms read wait, window maximum dispatch
 arrival gaps. Packet capture is still needed to separate network arrival from
 receiver scheduling; the observed ROS output rate is not the HMD sampling rate.
 
+## CPU forwarding optimization (2026-10-13)
+
+Topic subscribers receive raw ROS CDR bytes and wrap them in the existing TCP
+frame. Normal CDR1 little-endian data avoids the Python message allocation and
+deserialization/serialization cycle. Other encapsulations retain the previous
+typed conversion to preserve Unity's wire layout. Topic types, QoS, frequency
+policies, latest-only reconnect snapshots, service messages and input handling
+remain unchanged. Raw subscriptions are supported by the
+[Humble rclpy implementation](https://github.com/ros2/rclpy/blob/humble/rclpy/rclpy/node.py).
+
+Queued topics check their configured throttle before serializing. With no client,
+queued data is discarded before serialization; latest-only data still populates
+its reconnect cache. No new throttle is introduced.
+
+On the development PC (x86_64, Python 3.12.3), median CPU time for CDR conversion
+and TCP framing of an RGB8 image changed from 0.503 to 0.019 ms at 640×360 and
+1.120 to 0.145 ms at 1280×720. The framed bytes were identical. These timings
+exclude DDS, executor scheduling, networking and actual robot process load.
+
+The transport and raw forwarding suites passed 36 tests, including actual ROS
+image/scan/TF delivery, byte-identical payloads and big-endian normalization:
+
+```sh
+ROS_DOMAIN_ID=196 ROS_LOCALHOST_ONLY=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python3 -m pytest -q test/test_framed_input.py test/test_input_transport.py \
+  test/test_outbound_latency.py test/test_raw_forwarding.py
+```
+
+Restart the rebuilt endpoint to load the changes and compare CPU and delivery
+gaps on the robot with the same connected client and traffic.
+
 ## License
+
 [Apache License 2.0](LICENSE)

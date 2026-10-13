@@ -168,3 +168,54 @@ def test_throttled_latest_message_is_sent_when_due_without_another_notification(
         assert conn.sent[-1].received_at - conn.sent[-2].received_at >= .048
     finally:
         stop(transport, halt, thread)
+
+
+def test_queued_throttle_skips_serialization_without_changing_delivery(monkeypatch):
+    transport, _ = sender()
+    transport.topic_policies = {'/state': {'policy': 'queue', 'max_frequency': 10}}
+    output = OutboundQueue(10, None, threading.Event())
+    transport.queues = {1: output}
+    now = [1.0]
+    monkeypatch.setattr('ros_tcp_endpoint.tcp_sender.time.monotonic', lambda: now[0])
+    from ros_tcp_endpoint.client import ClientThread
+    original = ClientThread.serialize_message
+    calls = []
+
+    def serialize(topic, message):
+        calls.append(message.data)
+        return original(topic, message)
+
+    monkeypatch.setattr(ClientThread, 'serialize_message', serialize)
+    for i in range(100):
+        transport.send_unity_message('/state', Int32(data=i))
+    now[0] = 1.11
+    transport.send_unity_message('/state', Int32(data=100))
+    assert calls == [0, 100]
+    reader = FrameReader(None)
+    reader.feed(output.get_nowait() + output.get_nowait(), now[0])
+    assert [deserialize_message(frame.data, Int32).data for frame in reader.ready] == [0, 100]
+
+
+def test_disconnected_queue_skips_serialization_but_latest_keeps_reconnect_snapshot(monkeypatch):
+    transport, _ = sender()
+    transport.topic_policies = {'/cached': {'policy': 'latest_only'}}
+    from ros_tcp_endpoint.client import ClientThread
+    original = ClientThread.serialize_message
+    calls = []
+
+    def serialize(topic, message):
+        calls.append(topic)
+        return original(topic, message)
+
+    monkeypatch.setattr(ClientThread, 'serialize_message', serialize)
+    transport.send_unity_message('/queue', Int32(data=1))
+    transport.send_unity_message('/cached', Int32(data=2))
+    assert calls == ['/cached']
+    conn = ControlledConnection()
+    halt, thread = start(transport, conn)
+    try:
+        wait_for(lambda: len(conn.sent) == 2)
+        assert [frame.destination for frame in conn.sent] == ['__handshake', '/cached']
+        assert deserialize_message(conn.sent[-1].data, Int32).data == 2
+    finally:
+        stop(transport, halt, thread)
