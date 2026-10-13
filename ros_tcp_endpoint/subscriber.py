@@ -19,6 +19,7 @@ import uuid
 
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSReliabilityPolicy
 from rclpy.qos import QoSProfile
+from rclpy.serialization import deserialize_message
 
 from .communication import RosReceiver
 
@@ -53,8 +54,19 @@ class RosSubscriber(RosReceiver):
 
         # Start Subscriber listener function
         self.subscription = self.create_subscription(
-            self.msg, self.topic, self.send, qos_profile  # queue_size
+            self.msg, self.topic, self.send_serialized, qos_profile, raw=True
         )
+
+    def send_serialized(self, payload):
+        """Forward ROS CDR bytes directly; topic type and QoS stay unchanged."""
+        if not self._is_unregistered:
+            # Unity's reader expects the local CDR1 little-endian layout.
+            # Preserve the previous normalization for other encapsulations.
+            if payload[:2] == b'\x00\x01':
+                self.tcp_server.send_unity_serialized_message(self.topic, payload)
+            else:
+                self.tcp_server.send_unity_message(self.topic, deserialize_message(payload, self.msg))
+        return self.msg
 
     def send(self, data):
         """

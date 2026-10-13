@@ -141,11 +141,14 @@ class ClientThread(threading.Thread):
         Returns:
             serialized destination and message as a list of bytes
         """
+        return ClientThread.frame_serialized_message(destination, serialize_message(message))
+
+    @staticmethod
+    def frame_serialized_message(destination, serial_response):
+        """Wrap an existing ROS CDR payload without a deserialize/serialize cycle."""
         dest_bytes = destination.encode("utf-8")
         length = len(dest_bytes)
         dest_info = struct.pack("<I%ss" % length, length, dest_bytes)
-
-        serial_response = serialize_message(message)
 
         msg_length = struct.pack("<I", len(serial_response))
         serialized_message = dest_info + msg_length + serial_response

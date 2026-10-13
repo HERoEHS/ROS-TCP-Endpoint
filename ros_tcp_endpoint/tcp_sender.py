@@ -175,14 +175,19 @@ class UnityTcpSender:
         self._broadcast_to_all_clients(b"".join([serialized_header, serialized_message]))
 
     def send_unity_message(self, topic, message):
+        self._send_unity_message(topic, message, ClientThread.serialize_message)
+
+    def send_unity_serialized_message(self, topic, payload):
+        self._send_unity_message(topic, payload, ClientThread.frame_serialized_message)
+
+    def _send_unity_message(self, topic, message, serialize):
         """토픽 정책에 따라 메시지 전송"""
         policy = self._get_policy(topic)
         is_latest_only = policy.get('policy') == 'latest_only'
 
-        serialized_message = ClientThread.serialize_message(topic, message)
-
         if is_latest_only:
             # latest_only: 항상 최신 값 저장 (스로틀링과 무관)
+            serialized_message = serialize(topic, message)
             with self.latest_lock:
                 self.latest_messages[topic] = (serialized_message, time.monotonic())
             with self.queues_lock:
@@ -200,6 +205,12 @@ class UnityTcpSender:
                     return  # 스킵
                 self.last_send_time[topic] = now
 
+            # Queued topics have no reconnect cache. Avoid CDR serialization
+            # and image copies when there is nobody to receive this update.
+            with self.queues_lock:
+                if not self.queues:
+                    return
+            serialized_message = serialize(topic, message)
             self._broadcast_to_all_clients(serialized_message, droppable=True)
 
     def send_unity_service_request(self, topic, service_class, request):
