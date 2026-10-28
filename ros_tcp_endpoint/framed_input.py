@@ -12,7 +12,8 @@ import time
 LATEST_INPUT_TOPICS = frozenset({
     '/aeirobot/teleop/endpoint_pose', '/aeirobot/teleop/human_pose',
     '/aeirobot/teleop/left_hand', '/aeirobot/teleop/right_hand',
-    '/aeirobot/vr/cmd_vel',
+    '/aeirobot/vr/cmd_vel', '/aeirobot/teleop/waist_jog',
+    '/aeirobot/teleop/waist_pitch_jog',
 })
 
 
