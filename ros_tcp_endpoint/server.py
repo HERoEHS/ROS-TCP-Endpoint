@@ -552,6 +552,8 @@ class SysCommands:
             # identical entity sleeps twice in unregister_node and blocks ALL
             # incoming topics on this connection (including controller poses).
             self.tcp_server.loginfo("RegisterSubscriber({}) unchanged; reused".format(topic))
+            if hasattr(old_node, 'on_reregistered'):
+                old_node.on_reregistered()
             return
         if old_node is not None:
             self.tcp_server.unregister_node(old_node)
