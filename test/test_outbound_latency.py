@@ -219,3 +219,57 @@ def test_disconnected_queue_skips_serialization_but_latest_keeps_reconnect_snaps
         assert deserialize_message(conn.sent[-1].data, Int32).data == 2
     finally:
         stop(transport, halt, thread)
+
+
+def test_protocol_frames_bypass_data_backlog_without_reordering_each_other():
+    queue = OutboundQueue(10, None, threading.Event())
+    queue.offer(b'image1', droppable=True)
+    queue.offer(b'image2', droppable=True)
+    queue.offer(b'service-header-and-body')
+    queue.offer(b'topic-list')
+    assert queue.get_control_nowait() == b'service-header-and-body'
+    assert queue.get_control_nowait() == b'topic-list'
+    assert queue.get_nowait() == b'image1'
+    assert queue.get_nowait() == b'image2'
+
+
+def test_control_arriving_during_left_image_precedes_right_image():
+    transport, _ = sender()
+    transport.topic_policies = {topic: {'policy': 'latest_only'} for topic in ('/left', '/right')}
+    for topic in ('/left', '/right'):
+        transport.send_unity_message(topic, Int32(data=1))
+    conn = ControlledConnection(block_first_data=True)
+    halt, thread = start(transport, conn)
+    try:
+        assert conn.blocked.wait(1)
+        transport.send_unity_info('urgent control')
+        conn.release.set()
+        wait_for(lambda: len(conn.sent) == 4)
+        assert [frame.destination for frame in conn.sent] == ['__handshake', '/left', '__log', '/right']
+    finally:
+        conn.release.set()
+        stop(transport, halt, thread)
+
+
+def test_unlisted_camera_uses_latest_value_after_backpressure():
+    from sensor_msgs.msg import Image
+    transport, _ = sender()
+    topic = '/new_camera/image'
+    transport.set_topic_type(topic, Image)
+    assert transport._get_policy(topic)['policy'] == 'latest_only'
+    transport.send_unity_message(topic, Image(height=1))
+    conn = ControlledConnection(block_first_data=True)
+    halt, thread = start(transport, conn)
+    try:
+        assert conn.blocked.wait(1)
+        for value in range(2, 101):
+            transport.send_unity_message(topic, Image(height=value))
+        conn.release.set()
+        wait_for(lambda: len(conn.sent) == 3)
+        assert deserialize_message(conn.sent[-1].data, Image).height == 100
+        assert len(transport.latest_messages) == 1
+    finally:
+        conn.release.set()
+        stop(transport, halt, thread)
+    transport.topic_policies[topic] = {'policy': 'queue'}
+    assert transport._get_policy(topic)['policy'] == 'queue'

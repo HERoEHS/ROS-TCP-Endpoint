@@ -19,6 +19,7 @@ import time
 
 import threading
 import json
+from collections import deque
 
 from rclpy.serialization import deserialize_message
 from rclpy.serialization import serialize_message
@@ -50,7 +51,7 @@ class ClientThread(threading.Thread):
         # 클라이언트별 서비스 요청 상태 (race condition 방지)
         self.pending_srv_id = None
         self.pending_srv_is_request = False
-        self.input_timing = InputTiming(incoming_ip, tcp_server.logwarn)
+        self.input_timing = InputTiming(incoming_ip, tcp_server.logwarn, info=tcp_server.loginfo)
         self.quickack = getattr(socket, 'TCP_QUICKACK', None)
         self.reader = FrameReader(conn)
         threading.Thread.__init__(self)
@@ -194,7 +195,7 @@ class ClientThread(threading.Thread):
             # TODO: send a response to Unity anyway?
             return
 
-        self.tcp_server.unity_tcp_sender.send_ros_service_response(srv_id, destination, response)
+        self.tcp_server.unity_tcp_sender.send_ros_service_response(srv_id, destination, response, conn=self.conn)
 
     def dispatch(self, destination, data):
         """Dispatch one ordered frame, preserving service header/body pairing."""
@@ -233,11 +234,13 @@ class ClientThread(threading.Thread):
         """
         self.tcp_server.loginfo("Connection from {}".format(self.incoming_ip))
         halt_event = threading.Event()
+        self.tcp_server.unity_tcp_sender.register_client(self.conn)
         sender_thread = self.tcp_server.unity_tcp_sender.start_sender(self.conn, halt_event)
         try:
             while not halt_event.is_set():
                 read_started = time.monotonic()
                 batch = self.reader.read_batch()
+                self.input_timing.record_batch(batch)
                 # NODELAY governs server writes only. Promptly ACK incoming small
                 # controller frames too; Linux QUICKACK is transient, so re-arm.
                 if self.quickack is not None:
@@ -246,21 +249,33 @@ class ClientThread(threading.Thread):
                     except OSError:
                         self.quickack = None  # unsupported socket/platform; continue
 
-                selected = latest_frames(batch, self.pending_srv_id is not None)
-                self.input_timing.coalesced += len(batch) - len(selected)
-                for frame in selected:
+                # TCP로 묶여 왔다는 이유만으로 정상 샘플을 버리지 않는다.
+                # 실제 dispatch가 100Hz 한 주기(10ms)를 넘겨 밀릴 때만 남은 상태를 정리한다.
+                pending = deque(batch)
+                dispatch_started = time.monotonic()
+                reduced = False
+                while pending:
+                    if not reduced and time.monotonic() - dispatch_started >= .01:
+                        selected = latest_frames(pending, self.pending_srv_id is not None)
+                        self.input_timing.coalesced += len(pending) - len(selected)
+                        pending = deque(selected)
+                        reduced = True
+                    frame = pending.popleft()
                     if halt_event.is_set() or self.conn.fileno() < 0:
                         break
                     processing_started = time.monotonic()
                     # Only local residence time is known; do not pretend this is
                     # the HMD sample age. Never replay a queued pose as a heartbeat.
-                    if (self.pending_srv_id is None and frame.destination in LATEST_INPUT_TOPICS
-                            and processing_started - frame.received_at > .1):
+                    expired = (self.pending_srv_id is None and frame.destination in LATEST_INPUT_TOPICS
+                               and processing_started - frame.received_at > .1)
+                    forwarded = False
+                    if expired:
                         self.input_timing.expired += 1
                     else:
+                        forwarded = self.pending_srv_id is None and frame.destination in self.tcp_server.publishers_table
                         self.dispatch(frame.destination, frame.data)
                     self.input_timing.record(frame.destination, read_started, frame.received_at,
-                                             time.monotonic(), processing_started)
+                                             time.monotonic(), processing_started, forwarded=forwarded)
                     read_started = frame.received_at
         except (IOError, OSError) as e:
             # OFF 전환/종료로 소켓이 닫혀 발생하는 예외는 로그를 억제한다(tcp_enabled 일 때만 로깅).

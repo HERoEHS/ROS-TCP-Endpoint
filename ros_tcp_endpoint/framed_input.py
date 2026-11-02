@@ -88,19 +88,24 @@ class FrameReader:
 
 def latest_frames(frames, pending_service=False):
     """Keep latest state per topic without crossing event/service boundaries."""
+    # 처리 지연이 확인된 backlog에만 사용한다. 정상 TCP 묶음은 그대로 전달한다.
     pending = {}
     result = []
+
+    def flush():
+        result.extend(pending.values())
+        pending.clear()
+
     for frame in frames:
         if frame.destination in LATEST_INPUT_TOPICS and not pending_service:
             pending.pop(frame.destination, None)
             pending[frame.destination] = frame
             continue
-        result.extend(pending.values())  # order of the last wire occurrence
-        pending.clear()
+        flush()
         result.append(frame)
         if pending_service:
             pending_service = False
         elif frame.destination in ('__request', '__response'):
             pending_service = True
-    result.extend(pending.values())
+    flush()
     return result

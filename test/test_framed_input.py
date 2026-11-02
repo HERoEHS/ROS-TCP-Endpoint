@@ -14,6 +14,13 @@ HAND = '/aeirobot/teleop/left_hand'
 ONOFF = '/aeirobot/teleop/onoff'
 
 
+def test_overloaded_selector_does_not_cross_events():
+    old = [Frame(POSE, bytes([value]), .01 * value) for value in range(30)]
+    recent = [Frame(POSE, b'new1', .31), Frame(POSE, b'new2', .32)]
+    stop = Frame(ONOFF, b'OFF', .30)
+    assert latest_frames(old + [stop] + recent) == [old[-1], stop, recent[-1]]
+
+
 def wire(name, payload):
     encoded = name.encode()
     return struct.pack('<I', len(encoded)) + encoded + struct.pack('<I', len(payload)) + payload

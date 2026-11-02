@@ -33,3 +33,12 @@ class OutboundQueue:
             if not self.items:
                 raise Empty
             return self.items.popleft()[0]
+
+    def get_control_nowait(self):
+        """프로토콜 프레임끼리 순서를 유지하며 대용량 토픽보다 먼저 전달한다."""
+        with self.lock:
+            for index, (data, droppable) in enumerate(self.items):
+                if not droppable:
+                    del self.items[index]
+                    return data
+            raise Empty
