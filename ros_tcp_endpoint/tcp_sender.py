@@ -52,6 +52,9 @@ class UnityTcpSender:
         # 멀티 클라이언트 지원: 클라이언트별 큐 관리
         self.queues = {}  # {client_id: Queue}
         self.queues_lock = threading.Lock()
+        # 실제 연결은 자기 구독만 받는다. 직접 Python 등록은 기존 공용 전달을 유지한다.
+        self.subscriptions = {}
+        self.global_subscriptions = set()
 
         # variables needed for matching up unity service requests with responses
         self.next_srv_id = 1001
@@ -60,6 +63,8 @@ class UnityTcpSender:
 
         # 메모리 최적화: 토픽별 정책
         self.topic_policies = {}
+        self.message_type_policies = {}
+        self.topic_types = {}
         self.default_policy = {'policy': 'queue', 'max_queue_size': 100}
         self.latest_messages = {}  # {topic: serialized_message} for latest_only
         self.latest_lock = threading.Lock()
@@ -90,6 +95,7 @@ class UnityTcpSender:
             with open(path, 'r') as f:
                 config = yaml.safe_load(f)
             self.topic_policies = config.get('topic_policies', {}) or {}
+            self.message_type_policies = config.get('message_type_policies', {}) or {}
             self.default_policy = config.get('default_policy', self.default_policy)
             self.tcp_server.loginfo(f"Loaded topic policy config from {path}")
         except Exception as e:
@@ -97,7 +103,16 @@ class UnityTcpSender:
 
     def _get_policy(self, topic):
         """토픽별 정책 반환"""
-        return self.topic_policies.get(topic, self.default_policy)
+        fallback = self.message_type_policies.get(self.topic_types.get(topic), self.default_policy)
+        return self.topic_policies.get(topic, fallback)
+
+    def set_topic_type(self, topic, message_class):
+        self.topic_types[topic] = message_class.__module__.split('.')[0] + '/' + message_class.__name__
+
+    def forget_topic(self, topic):
+        self.topic_types.pop(topic, None)
+        with self.latest_lock:
+            self.latest_messages.pop(topic, None)
 
     def _queue_maxsize(self):
         """클라이언트 송신 큐 상한(항목 수). 0 이하 = 무제한.
@@ -112,7 +127,41 @@ class UnityTcpSender:
         except (TypeError, ValueError):
             return 0
 
-    def _broadcast_to_all_clients(self, data, droppable=False):
+    def register_client(self, conn):
+        with self.queues_lock:
+            self.subscriptions.setdefault(conn, set())
+
+    def subscribe(self, conn, topic):
+        with self.queues_lock:
+            if conn is None:
+                self.global_subscriptions.add(topic)
+            else:
+                self.subscriptions.setdefault(conn, set()).add(topic)
+            for queue in self.queues.values():
+                if conn is None or queue.conn is conn:
+                    queue.wake.set()
+
+    def unsubscribe(self, conn, topic):
+        with self.queues_lock:
+            if conn is None:
+                self.global_subscriptions.discard(topic)
+            else:
+                self.subscriptions.get(conn, set()).discard(topic)
+
+    def unregister_client(self, conn):
+        with self.queues_lock:
+            return self.subscriptions.pop(conn, set())
+
+    def has_subscribers(self, topic):
+        with self.queues_lock:
+            return topic in self.global_subscriptions or any(topic in topics for topics in self.subscriptions.values())
+
+    def wants_topic(self, conn, topic):
+        with self.queues_lock:
+            return (topic in self.global_subscriptions or conn not in self.subscriptions
+                    or topic in self.subscriptions[conn])
+
+    def _broadcast_to_all_clients(self, data, droppable=False, topic=None, conn=None):
         """모든 연결된 클라이언트에게 메시지 전송.
 
         droppable=True (토픽 메시지): 큐가 가득 차면 가장 오래된 폐기 가능한 항목을 교체한다.
@@ -121,7 +170,10 @@ class UnityTcpSender:
             폐기한다. 제어 메시지만으로 가득 차면 해당 연결을 종료하고 재접속으로 복구한다.
         """
         with self.queues_lock:
-            queues = list(self.queues.values())
+            queues = [queue for queue in self.queues.values()
+                      if (conn is None or queue.conn is conn)
+                      and (topic is None or topic in self.global_subscriptions
+                           or queue.conn not in self.subscriptions or topic in self.subscriptions[queue.conn])]
 
         dropped = 0
         for queue in queues:
@@ -167,12 +219,12 @@ class UnityTcpSender:
         serialized_bytes = ClientThread.serialize_command("__error", command)
         self._broadcast_to_all_clients(serialized_bytes)
 
-    def send_ros_service_response(self, srv_id, destination, response):
+    def send_ros_service_response(self, srv_id, destination, response, conn=None):
         command = SysCommand_Service()
         command.srv_id = srv_id
         serialized_header = ClientThread.serialize_command("__response", command)
         serialized_message = ClientThread.serialize_message(destination, response)
-        self._broadcast_to_all_clients(b"".join([serialized_header, serialized_message]))
+        self._broadcast_to_all_clients(b"".join([serialized_header, serialized_message]), conn=conn)
 
     def send_unity_message(self, topic, message):
         self._send_unity_message(topic, message, ClientThread.serialize_message)
@@ -211,7 +263,7 @@ class UnityTcpSender:
                 if not self.queues:
                     return
             serialized_message = serialize(topic, message)
-            self._broadcast_to_all_clients(serialized_message, droppable=True)
+            self._broadcast_to_all_clients(serialized_message, droppable=True, topic=topic)
 
     def send_unity_service_request(self, topic, service_class, request):
         # 연결된 클라이언트가 없으면 실패
@@ -266,7 +318,7 @@ class UnityTcpSender:
         else:
             return None
 
-    def send_topic_list(self):
+    def send_topic_list(self, conn=None):
         topic_list = SysCommand_TopicsResponse()
         topics_and_types = self.tcp_server.get_topic_names_and_types()
         topic_list.topics = [item[0] for item in topics_and_types]
@@ -286,7 +338,7 @@ class UnityTcpSender:
                 for item in topics_and_types
             ]
         serialized_bytes = ClientThread.serialize_command("__topic_list", topic_list)
-        self._broadcast_to_all_clients(serialized_bytes)
+        self._broadcast_to_all_clients(serialized_bytes, conn=conn)
 
     def start_sender(self, conn, halt_event):
         sender_thread = threading.Thread(
@@ -331,7 +383,11 @@ class UnityTcpSender:
 
                 # Protocol/queued events take precedence over camera snapshots.
                 try:
-                    conn.sendall(local_queue.get_nowait())
+                    try:
+                        data = local_queue.get_control_nowait()
+                    except Empty:
+                        data = local_queue.get_nowait()
+                    conn.sendall(data)
                     sent = True
                 except Empty:
                     pass
@@ -341,6 +397,8 @@ class UnityTcpSender:
                     latest_copy = dict(self.latest_messages)
 
                 for topic, snapshot in latest_copy.items():
+                    if not self.wants_topic(conn, topic):
+                        continue
                     msg, received_at = snapshot
                     # 이전에 보낸 메시지와 다를 때만 전송
                     if last_sent.get(topic) is not snapshot:
@@ -358,6 +416,11 @@ class UnityTcpSender:
                                 continue  # 이 토픽은 스킵
 
                         try:
+                            # 큰 좌/우 영상 사이에도 서비스·프로토콜 응답을 먼저 보낸다.
+                            try:
+                                conn.sendall(local_queue.get_control_nowait())
+                            except Empty:
+                                pass
                             conn.sendall(msg)
                             sent = True
                             last_sent[topic] = snapshot

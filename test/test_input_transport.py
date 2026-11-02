@@ -4,6 +4,8 @@ import json
 import socket
 import struct
 import time
+import threading
+from itertools import cycle
 
 import pytest
 import rclpy
@@ -16,6 +18,72 @@ from ros_tcp_endpoint.input_timing import InputTiming
 from ros_tcp_endpoint.server import TcpServer
 
 TOPIC = '/aeirobot/teleop/endpoint_pose'
+
+
+@pytest.mark.parametrize('batch_size', [1, 2, 3, 4, 'mixed80'])
+def test_real_100hz_tcp_input_preserves_short_network_batches(server, batch_size, record_property):
+    """200개의 실제 샘플을 TCP→ROS 구독자까지 센다. 보간·반복 발행은 없다."""
+    server.syscommands.publish(TOPIC, 'tf2_msgs/TFMessage')
+    publisher = server.publishers_table[TOPIC]
+    listener = rclpy.create_node('wireless_rate_observer')
+    received = []
+    listener.create_subscription(TFMessage, TOPIC,
+        lambda msg: received.append((time.monotonic(), msg.transforms[0].header.stamp.sec)),
+        QoSProfile(depth=1000, reliability=ReliabilityPolicy.RELIABLE))
+    finish = threading.Event()
+    def spin():
+        while not finish.is_set():
+            rclpy.spin_once(listener, timeout_sec=.005)
+    observer = threading.Thread(target=spin)
+    observer.start()
+    client = peer = None
+    try:
+        deadline = time.monotonic() + 3
+        while publisher.pub.get_subscription_count() == 0:
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+        with socket.socket() as acceptor:
+            acceptor.bind(('127.0.0.1', 0))
+            acceptor.listen(1)
+            peer = socket.create_connection(acceptor.getsockname())
+            host, _ = acceptor.accept()
+        peer.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        server._configure_client_socket(host)
+        client = ClientThread(host, server, '100hz-private-test', 0)
+        client.start()
+        start = time.monotonic()
+        frames = []
+        plan = cycle([1, 1, 2, 1] if batch_size == 'mixed80' else [batch_size])
+        target_batch = next(plan)
+        for value in range(200):
+            tf = TransformStamped()
+            tf.header.stamp.sec = value
+            frames.append(ClientThread.serialize_message(TOPIC, TFMessage(transforms=[tf])))
+            if len(frames) == target_batch or value == 199:
+                due = start + (value + 1) * .01
+                time.sleep(max(0, due - time.monotonic()))
+                peer.sendall(b''.join(frames))
+                frames.clear()
+                target_batch = next(plan)
+        deadline = time.monotonic() + .5
+        while len(received) < 200 and time.monotonic() < deadline:
+            time.sleep(.001)
+        hz = (len(received) - 1) / (received[-1][0] - received[0][0]) if len(received) >= 2 else 0
+        record_property('tcp_to_ros_hz', round(hz, 2))
+        record_property('real_samples_received', len(received))
+        assert [value for _, value in received] == list(range(200)), (
+            len(received), client.input_timing.coalesced, batch_size)
+        assert 97 <= hz <= 104
+    finally:
+        if peer is not None:
+            peer.close()
+        if client is not None:
+            client.join(3)
+            assert not client.is_alive()
+        finish.set()
+        observer.join(2)
+        assert not observer.is_alive()
+        listener.destroy_node()
 
 
 @pytest.fixture
@@ -126,6 +194,22 @@ def test_healthy_stream_has_no_gap_warning():
         t = i * .01
         monitor.record(TOPIC, t, t + .0001, t + .0002)
     assert not warnings
+
+
+def test_rate_report_separates_received_samples_from_ros_publications():
+    from ros_tcp_endpoint.framed_input import Frame
+    reports = []
+    monitor = InputTiming('rate-test', lambda text: None, clock=lambda: 0, info=reports.append)
+    monitor.record_batch([Frame(TOPIC, b'data', at) for at in (0, .01, .02)])
+    monitor.record(TOPIC, 0, 0, .001)
+    monitor.coalesced = 1
+    monitor.expired = 1
+    monitor.record(TOPIC, .01, .01, .2, forwarded=False)
+    monitor.record('__topic_list', 5, 5, 5.001)
+    assert len(reports) == 1
+    assert 'received=3,forwarded=1' in reports[0]
+    assert 'coalesced=1 expired=1' in reports[0]
+    assert not monitor.wire_counts and not monitor.forwarded_counts
 
 
 def test_delayed_burst_delivers_newest_pose_without_replaying_old_frames(server, record_property):

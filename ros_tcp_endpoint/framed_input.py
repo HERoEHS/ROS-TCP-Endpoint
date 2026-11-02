@@ -1,6 +1,7 @@
 """Bounded buffered TCP framing and latest-value teleop burst handling."""
 
 from collections import deque
+from collections import Counter
 from dataclasses import dataclass
 import select
 import struct
@@ -86,21 +87,30 @@ class FrameReader:
         return [self.ready.popleft() for _ in range(min(len(self.ready), self.MAX_BATCH_FRAMES))]
 
 
-def latest_frames(frames, pending_service=False):
+def latest_frames(frames, pending_service=False, *, preserve_short_bursts=False):
     """Keep latest state per topic without crossing event/service boundaries."""
-    pending = {}
+    # 100 Hz가 TCP/무선에서 2~4개씩 묶여도 정상 샘플을 버리지 않는다.
+    # 큰 밀림은 최신 값만 남기며, 로컬 100 ms 만료 검사는 dispatch 직전에 별도로 한다.
+    burst_limit = 4 if preserve_short_bursts else 1
+    pending = []
     result = []
+
+    def flush():
+        counts = Counter(frame.destination for frame in pending)
+        last = {frame.destination: index for index, frame in enumerate(pending)}
+        result.extend(frame for index, frame in enumerate(pending)
+                      if counts[frame.destination] <= burst_limit or last[frame.destination] == index)
+        pending.clear()
+
     for frame in frames:
         if frame.destination in LATEST_INPUT_TOPICS and not pending_service:
-            pending.pop(frame.destination, None)
-            pending[frame.destination] = frame
+            pending.append(frame)
             continue
-        result.extend(pending.values())  # order of the last wire occurrence
-        pending.clear()
+        flush()
         result.append(frame)
         if pending_service:
             pending_service = False
         elif frame.destination in ('__request', '__response'):
             pending_service = True
-    result.extend(pending.values())
+    flush()
     return result

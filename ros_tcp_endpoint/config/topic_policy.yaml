@@ -7,6 +7,18 @@
 # max_frequency: Hz 단위 스로틀링 (선택, 0 = 무제한)
 # max_age: latest_only 스냅샷의 송신 대기 수명 [s] (선택, 0 = 제한 없음)
 
+# 명시한 토픽 정책이 이 기본 메시지 형식 정책보다 우선한다.
+# 이름이 다른 카메라도 100장의 오래된 영상을 순서대로 보내지 않는다.
+message_type_policies:
+  sensor_msgs/Image:
+    policy: latest_only
+    max_frequency: 30
+    max_age: 0.25
+  sensor_msgs/CompressedImage:
+    policy: latest_only
+    max_frequency: 30
+    max_age: 0.25
+
 topic_policies:
   # 예시: 고주파 센서 토픽 - 최신 값만 유지
   /joint_states:

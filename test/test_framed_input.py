@@ -14,6 +14,19 @@ HAND = '/aeirobot/teleop/left_hand'
 ONOFF = '/aeirobot/teleop/onoff'
 
 
+@pytest.mark.parametrize('batch_size', [1, 2, 3, 4])
+def test_fresh_100hz_short_tcp_bursts_keep_each_real_sample(batch_size):
+    frames = [Frame(POSE, bytes([value]), .01 * value) for value in range(batch_size)]
+    assert latest_frames(frames, preserve_short_bursts=True) == frames
+
+
+def test_short_burst_preservation_does_not_replay_large_backlog_or_cross_events():
+    old = [Frame(POSE, bytes([value]), .01 * value) for value in range(30)]
+    recent = [Frame(POSE, b'new1', .31), Frame(POSE, b'new2', .32)]
+    stop = Frame(ONOFF, b'OFF', .30)
+    assert latest_frames(old + [stop] + recent, preserve_short_bursts=True) == [old[-1], stop, *recent]
+
+
 def wire(name, payload):
     encoded = name.encode()
     return struct.pack('<I', len(encoded)) + encoded + struct.pack('<I', len(payload)) + payload

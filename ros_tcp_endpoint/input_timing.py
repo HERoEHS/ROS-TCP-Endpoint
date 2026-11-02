@@ -1,6 +1,7 @@
 """Measure TCP read/dispatch stalls without treating old data as fresh input."""
 
 import time
+from collections import Counter
 
 
 class InputTiming:
@@ -8,10 +9,13 @@ class InputTiming:
 
     POSE_TOPICS = {'/aeirobot/teleop/endpoint_pose', '/aeirobot/teleop/human_pose'}
 
-    def __init__(self, peer, warn, clock=time.monotonic):
+    def __init__(self, peer, warn, clock=time.monotonic, info=None):
         self.peer = peer
         self.warn = warn
         self.clock = clock
+        self.info = info
+        self.wire_counts = Counter()
+        self.forwarded_counts = Counter()
         self.previous_pose = {}
         self.report_at = clock()
         self.frames = 0
@@ -20,8 +24,13 @@ class InputTiming:
         self.coalesced = self.expired = 0
         self.max_queue = 0.0
 
-    def record(self, destination, read_started, received, dispatched, processing_started=None):
+    def record_batch(self, frames):
+        self.wire_counts.update(frame.destination for frame in frames if frame.destination in self.POSE_TOPICS)
+
+    def record(self, destination, read_started, received, dispatched, processing_started=None, *, forwarded=True):
         """Account for one fully received and dispatched wire frame."""
+        if forwarded and destination in self.POSE_TOPICS:
+            self.forwarded_counts[destination] += 1
         if not self.previous_pose:
             if destination in self.POSE_TOPICS:
                 self.previous_pose[destination] = received
@@ -42,6 +51,13 @@ class InputTiming:
             self.previous_pose[destination] = received
         if dispatched - self.report_at < 5.0:
             return
+        if self.info is not None and self.wire_counts:
+            interval = dispatched - self.report_at
+            rates = ' '.join('{}:rx={:.1f}Hz/ros_publish={:.1f}Hz(received={},forwarded={})'.format(
+                topic, count / interval, self.forwarded_counts[topic] / interval,
+                count, self.forwarded_counts[topic]) for topic, count in sorted(self.wire_counts.items()))
+            self.info('[TeleopRate] peer={} {} coalesced={} expired={}'.format(
+                self.peer, rates, self.coalesced, self.expired))
         if (self.previous_pose and
                 (max(self.max_gap, self.max_dispatch, self.max_queue) >= .1 or self.coalesced or self.expired)):
             self.warn(
@@ -59,3 +75,5 @@ class InputTiming:
         self.slow_destination = ''
         self.coalesced = self.expired = 0
         self.max_queue = 0.0
+        self.wire_counts.clear()
+        self.forwarded_counts.clear()

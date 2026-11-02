@@ -67,6 +67,7 @@ class TcpServer(Node):
         # (송신 큐 상한은 topic_policy.yaml 의 default_policy.max_queue_size 가 담당한다 —
         #  별도 파라미터를 두지 않고 기존 정책 설정을 그대로 쓴다.)
         self.declare_parameter("TCP_NODELAY", True)
+        self.declare_parameter("TCP_NOTSENT_LOWAT", 16384)
         self.declare_parameter("TCP_KEEPALIVE", True)
         self.declare_parameter("TCP_KEEPIDLE", 2)     # 유휴 후 첫 프로브까지 [s]
         self.declare_parameter("TCP_KEEPINTVL", 1)    # 프로브 간격 [s]
@@ -90,6 +91,7 @@ class TcpServer(Node):
         config_path = config_path if config_path else None
 
         self.tcp_nodelay = self.get_parameter("TCP_NODELAY").get_parameter_value().bool_value
+        self.tcp_notsent_lowat = self.get_parameter("TCP_NOTSENT_LOWAT").get_parameter_value().integer_value
         self.tcp_keepalive = self.get_parameter("TCP_KEEPALIVE").get_parameter_value().bool_value
         self.tcp_keepidle = self.get_parameter("TCP_KEEPIDLE").get_parameter_value().integer_value
         self.tcp_keepintvl = self.get_parameter("TCP_KEEPINTVL").get_parameter_value().integer_value
@@ -154,6 +156,10 @@ class TcpServer(Node):
             self.publishers_table = publishers
         if subscribers is not None:
             self.subscribers_table = subscribers
+            # Python에서 미리 등록한 공용 구독은 기존 전달 범위를 유지한다.
+            for topic, subscriber in subscribers.items():
+                self.unity_tcp_sender.set_topic_type(topic, subscriber.msg)
+                self.unity_tcp_sender.subscribe(None, topic)
         self._publish_enabled(False)
         self._server_thread = threading.Thread(target=self.listen_loop)
         # Exit the server thread when the main thread terminates
@@ -245,6 +251,13 @@ class TcpServer(Node):
                         conn.setsockopt(socket.IPPROTO_TCP, opt, value)
         except OSError as exc:
             self.logwarn("Failed to apply socket options: {}".format(exc))
+        # 커널에 영상 여러 장을 미리 쌓지 않고 사용자 공간의 최신 프레임을 고를 기회를 남긴다.
+        option = getattr(socket, 'TCP_NOTSENT_LOWAT', None)
+        if option is not None and self.tcp_notsent_lowat > 0:
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, option, self.tcp_notsent_lowat)
+            except OSError as exc:
+                self.logwarn("TCP_NOTSENT_LOWAT unavailable: {}".format(exc))
 
     def _drop_other_clients(self, keep_conn):
         """SINGLE_CLIENT 모드: 같은 단말(동일 IP)의 이전 연결만 정리한다.
@@ -293,6 +306,8 @@ class TcpServer(Node):
             removed = self._client_sockets.pop(conn, None)
         if removed is not None:
             self._publish_status()
+        # 연결 끊김을 먼저 알린다. ROS 구독 해제의 정리 대기가 정지 신호를 늦추면 안 된다.
+        self.syscommands._client_disconnected(conn)
 
     def set_tcp_enabled(self, enabled):
         """TCP 리스닝을 켜고/끈다. OFF 전환 시 모든 클라이언트를 끊는다."""
@@ -387,21 +402,24 @@ class TcpServer(Node):
         self.unity_tcp_sender.send_unity_service_response(srv_id, data)
 
     def handle_syscommand(self, topic, data, client=None):
-        function = getattr(self.syscommands, topic[2:], None)
-        if function is None:
+        name = topic[2:]
+        function = getattr(self.syscommands, name, None) if not name.startswith('_') else None
+        if not callable(function):
             self.send_unity_error("Don't understand SysCommand.'{}'".format(topic))
             return
 
+        previous = self.syscommands.current_client
         try:
             message_json = data.decode("utf-8")[:-1]
             params = json.loads(message_json)
             # 서비스 요청/응답 명령은 클라이언트 참조 필요
             self.syscommands.current_client = client
             function(**params)
-            self.syscommands.current_client = None
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             self.send_unity_error("Invalid syscommand data for '{}': {}".format(topic, e))
             self.logerr("Failed to parse syscommand '{}': {}".format(topic, e))
+        finally:
+            self.syscommands.current_client = previous
 
     def loginfo(self, text):
         self.get_logger().info(text)
@@ -528,9 +546,28 @@ class TcpServer(Node):
 class SysCommands:
     def __init__(self, tcp_server):
         self.tcp_server = tcp_server
-        self.current_client = None  # 현재 요청을 처리 중인 클라이언트
+        self._context = threading.local()
+        self._subscriptions_lock = threading.RLock()
+
+    @property
+    def current_client(self):
+        return getattr(self._context, 'client', None)
+
+    @current_client.setter
+    def current_client(self, client):
+        self._context.client = client
+
+    def _client_disconnected(self, conn):
+        with self._subscriptions_lock:
+            topics = self.tcp_server.unity_tcp_sender.unregister_client(conn)
+            for topic in topics:
+                self._remove_unused_subscriber(topic)
 
     def subscribe(self, topic, message_name):
+        with self._subscriptions_lock:
+            return self._subscribe(topic, message_name)
+
+    def _subscribe(self, topic, message_name):
         if topic == "":
             self.tcp_server.send_unity_error(
                 "Can't subscribe to a blank topic name! SysCommand.subscribe({}, {})".format(
@@ -546,6 +583,9 @@ class SysCommands:
             )
             return
 
+        client = self.current_client
+        self.tcp_server.unity_tcp_sender.set_topic_type(topic, message_class)
+        self.tcp_server.unity_tcp_sender.subscribe(client.conn if client is not None else None, topic)
         old_node = self.tcp_server.subscribers_table.get(topic)
         if old_node is not None and old_node.msg is message_class:
             # Unity repeats registration on reconnect/start. Rebuilding an
@@ -667,7 +707,8 @@ class SysCommands:
             self.current_client.pending_srv_is_request = True
 
     def topic_list(self):
-        self.tcp_server.unity_tcp_sender.send_topic_list()
+        client = self.current_client
+        self.tcp_server.unity_tcp_sender.send_topic_list(conn=client.conn if client is not None else None)
 
     def resolve_message_name(self, name, extension="msg"):
         try:
@@ -688,6 +729,12 @@ class SysCommands:
             return None
 
     def remove_subscriber(self, topic):
+        with self._subscriptions_lock:
+            client = self.current_client
+            self.tcp_server.unity_tcp_sender.unsubscribe(client.conn if client is not None else None, topic)
+            self._remove_unused_subscriber(topic)
+
+    def _remove_unused_subscriber(self, topic):
         if topic == "":
             self.tcp_server.send_unity_error(
                 "Can't unsubscribe to a blank topic name! SysCommand.remove_subscriber({})".format(
@@ -696,6 +743,8 @@ class SysCommands:
             )
             return
 
+        if self.tcp_server.unity_tcp_sender.has_subscribers(topic):
+            return
         node = self.tcp_server.subscribers_table.get(topic)
         if node is not None:
             # 먼저 테이블에서 제거
@@ -704,6 +753,7 @@ class SysCommands:
             # 그 다음 노드 정리
             self.tcp_server.unregister_node(node)
             self.tcp_server.loginfo("UnregisterSubscriber({}) OK".format(topic))
+            self.tcp_server.unity_tcp_sender.forget_topic(topic)
         else:
             self.tcp_server.logwarn(
                 "Topic '{}' was not subscribed, ignoring remove_subscriber request.".format(
