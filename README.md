@@ -59,8 +59,9 @@ sender/network path; changing IK or relaxing the stop timeout is not a repair.
 
 The TCP reader collects bytes already available without a batching sleep, bounded
 to 64 KiB of extra reads, 256 returned frames and a 1 ms drain budget. Within each
-batch, short groups of up to four samples per state topic retain every real
-sample. Larger state backlogs retain only their latest value. ON/OFF, recording, system commands and service
+batch, every real sample is retained while dispatch keeps up. Only after
+processing spends a 10 ms control period does the remaining backlog retain
+its latest state per topic. ON/OFF, recording, system commands and service
 header/body pairs remain ordered barriers: state frames never merge across them.
 The allowlist is `LATEST_INPUT_TOPICS` in `framed_input.py`.
 
@@ -81,8 +82,9 @@ the protocol. The handshake always precedes cached data on reconnect.
 
 ## M2 100Hz 입력과 무선 단말 격리 (2026-11-02)
 
-TCP는 100Hz 입력도 2~4개씩 묶어서 전달할 수 있습니다. 기존 수신부가 짧은 묶음도 한 개로
-줄이던 동작을 수정했습니다. 큰 밀림·로컬 100ms 만료 입력은 계속 정리하며, 마지막 값을
+TCP는 100Hz 입력도 여러 개씩 묶어서 전달할 수 있습니다. 묶음 크기로 정상 샘플을 버리지 않습니다.
+실제 처리 시간이 10ms를 넘겨 밀릴 때만 남은 상태 입력을 최신 값으로 정리합니다.
+로컬 100ms 만료 검사를 유지하며, 마지막 값을
 반복하거나 보간해서 Hz를 올리지 않습니다. M2의 200ms 입력 워치독과 복구 후 명시적 ON 규칙은 유지합니다.
 
 - 각 Unity 연결에는 그 단말이 구독한 토픽만 보냅니다. HMD 영상을 구독하지 않은 조이스틱으로
@@ -103,22 +105,28 @@ TCP는 100Hz 입력도 2~4개씩 묶어서 전달할 수 있습니다. 기존 �
 
 | 도착 방식 | 기존 실제 수신 | 수정 후 실제 수신 |
 |---|---:|---:|
-| 한 개씩 | 100.01Hz · 200개 | 100.01Hz · 200개 |
-| 두 개씩 | 50.01Hz · 100개 | 100.51Hz · 200개 |
-| 세 개씩 | 33.51Hz · 67개 | 101.03Hz · 200개 |
-| 네 개씩 | 25.00Hz · 50개 | 101.52Hz · 200개 |
-| 1·1·2·1개씩 반복 | 79.90Hz · 160개 | 100.01Hz · 200개 |
+| 한 개씩 | 약100Hz · 200개 | 약100Hz · 200개 |
+| 두 개씩 | 50.01Hz · 100개 | 약100Hz · 200개 |
+| 세 개씩 | 33.51Hz · 67개 | 약100Hz · 200개 |
+| 네 개씩 | 25.00Hz · 50개 | 약100Hz · 200개 |
+| 1·1·2·1개씩 반복 | 79.90Hz · 160개 | 약100Hz · 200개 |
 
-묶음의 처음/마지막 시각 때문에 짧은 관측 창에서 Hz가100보다 조금 크게 계산될 수 있지만
-모든 경우 원본200개만 발행했습니다. 개발 PC의 loopback 재현이며 실기 무선망의 보장 수치가 아닙니다.
+1·2·3·4·5·8·10·16개 묶음과 혼합 도착에서 원본200개를 모두 확인했습니다.
+수신한200개를 송신 시작부터 마지막 수신까지의 시간으로 나눠 창 전체의 Hz를 구합니다.
+별도 MuJoCo 실시간 측정에서는 첫 수정의4개 제한 때문에 TCP1500개/약100Hz 중 ROS1194개/약80Hz만
+도착하는 문제가 확인돼, 갯수 제한을 위 처리 시간 기준으로 바꿨습니다.
+같은 실행 환경에서 수정 후15초 동안 TCP99.99Hz·ROS100.39Hz를 측정했고 합친 수/만료 수는0이었습니다.
+두 관측의 시작 경계가 약간 다르므로 샘플 수를 완전히 같은 구간의 송신/수신 비교로 해석하지 않습니다.
+loopback 결과를 실기 무선망의 보장 수치로 해석하지 않습니다.
 PR85는 ASH 웹/호스트의 권한 검사 변경이며 TCP 전송 코드를 바꾸지 않았습니다. 이번 재현은
 Endpoint의 별도 병목을 확인한 것이고 실제 무선 손실·HMD 송신률은 실기에서 다시 측정해야 합니다.
 
 변경은 Endpoint 프로세스를 다시 실행해야 반영됩니다. 일반 설치본은 사용자 `rs`·`cbo` 빌드가
 필요하며, 이 작업에서는 ROS 빌드·실기 Endpoint/ASH 재시작·무선 장치 설정 변경을 하지 않았습니다.
+후속 실시간 검증에서는 개발 PC의 MuJoCo 테스트용 TCP만 정상 종료·재시작하고 다른 앱은 유지했습니다.
 
 최종 검증은 TCP 기능59개와 실제 M2 노드를 격리 도메인에서 실행한 입력 손실/명시적 재시작 시험1개가
-통과했습니다. 기존 코드에 같은100Hz 시험을 적용하면 묶음 입력4개 조건에서 샘플 손실이 재현됩니다.
+통과했습니다. 기존 코드에 같은100Hz 시험을 적용하면 네 가지 묶음 입력 조건에서 샘플 손실이 재현됩니다.
 
 Initial port-bind failure exits the endpoint immediately. It does not leave an
 inactive duplicate publishing connection status or serving the same ROS services.
@@ -142,8 +150,9 @@ when the sibling fixture is absent. The separate M2 invalid/missing pose guard
 regression also passed all 5 cases.
 
 A synthetic backlog of 30 poses with 10 ms injected processing cost per pose
-delivered the latest in approximately 11 ms and skipped 29 older poses. This is
-a server backlog measurement, not a measured wireless latency improvement.
+now sends the first sample, detects the processing overrun, and finishes with
+the newest sample instead of replaying the other 28. This is a server backlog
+regression, not a measured wireless latency improvement.
 Restart the TCP endpoint to load changes; new live HMD measurements are needed
 to assess end-to-end latency, which these arrival-gap diagnostics do not measure.
 

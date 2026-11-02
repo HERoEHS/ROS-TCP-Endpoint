@@ -19,6 +19,7 @@ import time
 
 import threading
 import json
+from collections import deque
 
 from rclpy.serialization import deserialize_message
 from rclpy.serialization import serialize_message
@@ -248,9 +249,18 @@ class ClientThread(threading.Thread):
                     except OSError:
                         self.quickack = None  # unsupported socket/platform; continue
 
-                selected = latest_frames(batch, self.pending_srv_id is not None, preserve_short_bursts=True)
-                self.input_timing.coalesced += len(batch) - len(selected)
-                for frame in selected:
+                # TCP로 묶여 왔다는 이유만으로 정상 샘플을 버리지 않는다.
+                # 실제 dispatch가 100Hz 한 주기(10ms)를 넘겨 밀릴 때만 남은 상태를 정리한다.
+                pending = deque(batch)
+                dispatch_started = time.monotonic()
+                reduced = False
+                while pending:
+                    if not reduced and time.monotonic() - dispatch_started >= .01:
+                        selected = latest_frames(pending, self.pending_srv_id is not None)
+                        self.input_timing.coalesced += len(pending) - len(selected)
+                        pending = deque(selected)
+                        reduced = True
+                    frame = pending.popleft()
                     if halt_event.is_set() or self.conn.fileno() < 0:
                         break
                     processing_started = time.monotonic()

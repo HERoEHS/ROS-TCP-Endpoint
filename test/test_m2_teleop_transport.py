@@ -66,7 +66,7 @@ def test_tcp_bursts_keep_m2_active_but_loss_requires_explicit_restart(tmp_path, 
     try:
         fixture.activate()
         fixture.hold(.7, require_active=True)
-        assert client.input_timing.coalesced > 0
+        assert client.input_timing.forwarded_counts.get(pose_topic, 0) > 0
         fixture.pose_enabled = False
         fixture.hold(.07, require_active=True)
         fixture.pose_enabled = True
